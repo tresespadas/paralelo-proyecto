@@ -1,0 +1,9 @@
+# values/juiceshop.yaml — overrides del chart custom charts/juiceshop
+#
+# Pattern coherente con values/dvwa.yaml y values/webgoat.yaml.
+
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+service:
+  nodePort: 31592

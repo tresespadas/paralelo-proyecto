@@ -1,0 +1,164 @@
+# values/loki.yaml — Loki standalone en modo SingleBinary
+#
+# Scope activo:
+#   - loki (SingleBinary: ingester+querier+distributor+compactor en un solo proceso)
+#
+# Scope desactivado:
+#   - read / write / backend  (solo aplican en Simple Scalable — requiere object storage)
+#   - chunksCache / resultsCache  (memcached innecesarios en SingleBinary)
+#   - gateway                 (nginx reverse proxy — Promtail habla directo al Service)
+#   - lokiCanary / test       (componentes de testing/self-monitoring)
+#   - sidecar.rules           (kiwigrid/k8s-sidecar — descubre reglas LogQL en ConfigMaps)
+#
+# Decisión arquitectónica clave: deploymentMode = SingleBinary es el único
+# modo compatible con filesystem storage. Simple Scalable y Distributed
+# REQUIEREN object storage (S3/GCS/MinIO) por el comentario explícito del
+# chart. Como solo tenemos hostPath en worker2, SingleBinary es la opción
+# obligada; no es una decisión de "simplicidad pedagógica".
+
+deploymentMode: SingleBinary
+
+loki:
+  # Multi-tenant desactivado — no lo necesitamos en el lab.
+  auth_enabled: false
+
+  commonConfig:
+    # Una sola réplica en SingleBinary ⇒ replication_factor 1 (no 3 del default).
+    replication_factor: 1
+
+  storage:
+    # Override crítico: el default del chart es 's3'. SingleBinary necesita
+    # filesystem para apoyarse en el hostPath /mnt/data/loki.
+    type: filesystem
+
+  # Retención de 7 días — coherente con Prometheus. Default del chart es 0
+  # (infinito), que en un lab con 5Gi se llenaría en semanas.
+  limits_config:
+    retention_period: 168h
+    # max_query_series y split_queries_by_interval acotan el tamaño del
+    # resultado de queries pesadas. Sin esto, una query topk con miles
+    # de cardinalidades puede devolver mensajes gRPC > 4MB que rompen
+    # el bus interno (visto: "grpc: received message larger than max").
+    split_queries_by_interval: 15m
+    max_query_series: 5000
+    max_entries_limit_per_query: 5000
+
+  # Server config: ampliar tamaño máximo de mensaje gRPC.
+  # Default es 4MB; bajo flood (nikto+gobuster+sqlmap en paralelo contra
+  # tres CMS) las queries del dashboard devuelven >10MB de payload.
+  # 32MB cubre con margen el escenario "lab bajo ataque".
+  server:
+    grpc_server_max_recv_msg_size: 33554432    # 32 MiB
+    grpc_server_max_send_msg_size: 33554432
+    http_server_read_timeout: 60s
+    http_server_write_timeout: 60s
+
+  # En Loki 3.x el schemaConfig es obligatorio: si no se declara, el chart
+  # loggea warnings y puede romper upgrades futuros por cambio de default.
+  # La fecha 'from' es un punto de partida arbitrario en el pasado; a partir
+  # de ahí Loki usa TSDB. v13 es el schema actual recomendado.
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+
+# Configuración del StatefulSet que aloja el único pod de Loki.
+singleBinary:
+  replicas: 1
+
+  persistence:
+    enabled: true
+    size: 5Gi                             # Match con capacity del PV (loki-pv.yaml).
+    # storageClassName vacío fuerza binding estático: el PVC autogenerado
+    # (storage-loki-0) matchea con loki-pv por capacity+accessModes+SC.
+    storageClassName: ""
+    # Default del chart es 'true' — con 'true' un `helm uninstall` borra el
+    # PVC automáticamente, dejando el PV en estado Released (inutilizable
+    # hasta limpiar claimRef a mano). Lo apagamos para preservar el vínculo
+    # entre el PV y los datos entre uninstalls.
+    enableStatefulSetAutoDeletePVC: false
+
+  # Anclamos a worker2 (mismo nodo que Grafana + Prometheus).
+  # Razón: el PV es hostPath → los datos viven físicamente en worker2.
+  nodeSelector:
+    kubernetes.io/hostname: worker2
+
+  # Resources: triplicado tras el incidente del pen-test. El default 256Mi
+  # aguantaba operación normal (~5 events/s) pero bajo flood (nikto+gobuster+
+  # sqlmap = ~500 events/s) Loki necesita RAM para:
+  #   - ingest buffers + WAL writes
+  #   - decompress chunks durante queries del dashboard (auto-refresh 5s)
+  #   - pattern matching de label_format en label_format / hasPrefix
+  # Verificado empíricamente: con 256Mi → OOMKill loop tras ~2min de carga
+  # alta. 768Mi cubre con margen el escenario peor caso del lab.
+  # CPU 200m porque las queries de count_over_time con 30k+ líneas son
+  # CPU-bound durante el decompress.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 768Mi
+
+# --- Componentes explícitamente desactivados ---
+#
+# Los replicas:0 para read/write/backend son redundantes con deploymentMode,
+# pero los declaramos explícitos por dos razones: (1) defensiva — si alguien
+# cambia deploymentMode sin pensar, estos siguen en 0; (2) documental — deja
+# claro a quien lee el values qué componentes están apagados.
+
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+# Memcached delante de Loki es útil en Simple Scalable (donde read queries
+# viajan por red a object storage). En SingleBinary el storage es local al
+# proceso: un cache de red añadiría latencia, no la ahorraría.
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+
+# Gateway = nginx reverse proxy. Tiene sentido en producción multi-tenant
+# con TLS termination. En el lab Promtail y Grafana hablan directo al
+# Service de Loki por DNS interno (loki.monitoring.svc.cluster.local:3100).
+gateway:
+  enabled: false
+
+# Sidecar kiwigrid/k8s-sidecar que el chart inyecta en el pod de Loki para
+# vigilar ConfigMaps/Secrets etiquetados con 'loki_rule=' y montar su
+# contenido en /rules (donde el componente 'ruler' de Loki lo consume para
+# alerting/recording en LogQL). No usamos alerting en Loki en este lab,
+# así que es un container extra sin función.
+sidecar:
+  rules:
+    enabled: false
+
+# Canary = pod tester que genera logs sintéticos y valida round-trip. Útil
+# para monitorizar Loki en producción, ruido en un lab de aprendizaje.
+lokiCanary:
+  enabled: false
+
+# Helm test pod — lanza un pod que pincha el health endpoint. No lo usamos.
+test:
+  enabled: false
+
+# Self-monitoring = el chart intenta desplegar un Grafana Agent Operator
+# para monitorizarse a sí mismo. En nuestro lab ya tenemos Prometheus
+# standalone y no queremos un segundo agente métrico coexistiendo.
+monitoring:
+  selfMonitoring:
+    enabled: false
+    grafanaAgent:
+      installOperator: false
+  lokiCanary:
+    enabled: false

@@ -1,0 +1,98 @@
+# values/prometheus.yaml — standalone Prometheus (scope medium)
+#
+# Scope activo:
+#   - server (TSDB + API + UI)
+#   - node-exporter (DaemonSet; métricas de SO por nodo)
+#   - kube-state-metrics (métricas sobre objetos de la API de k8s)
+#
+# Scope desactivado (lo dejamos fuera por ruido pedagógico y ahorro de RAM):
+#   - alertmanager (sin rutas de salida útiles en el lab)
+#   - pushgateway (no tenemos batch jobs que lo necesiten)
+
+server:
+  persistentVolume:
+    enabled: true
+    existingClaim: prometheus-pvc
+
+  # Desactivamos el init container que hace chown al volumen.
+  # Ya hicimos el chown a mano (UID 65534) en /mnt/data/prometheus en worker2,
+  # y así evitamos depender del pull de busybox desde Docker Hub — mismo fix
+  # que aplicamos con Grafana.
+  initChownData:
+    enabled: false
+
+  service:
+    type: NodePort
+    nodePort: 30090
+
+  # Anclamos el server a worker2 (mismo nodo que Grafana: concentración
+  # de monitoring + hostPath local).
+  nodeSelector:
+    kubernetes.io/hostname: worker2
+
+  # Retención moderada para el lab; el default es 15d.
+  retention: "7d"
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# Alertmanager: desactivado (no usamos rutas de alerta todavía).
+alertmanager:
+  enabled: false
+
+# Pushgateway: desactivado (no hay jobs batch en este lab).
+prometheus-pushgateway:
+  enabled: false
+
+# node-exporter: se queda activado (DaemonSet, corre en los 3 nodos).
+# Requests conservadores para no saturar workers con 4GB.
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+# kube-state-metrics: se queda activado (expone el estado de la API de k8s).
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 64Mi
+
+# extraScrapeConfigs DESACTIVADO (2026-05-11) — eliminamos el job
+# 'node-exporter-clean' porque convivía con el job auto-discoverido
+# 'kubernetes-service-endpoints' del default del chart, scrapeando el
+# MISMO endpoint :9100 dos veces. Resultado: 2 series Prometheus por
+# nodo+metric, con labels distintos pero valores casi idénticos.
+# Detectado al ver el panel "Memoria por nodo" mostrando series
+# duplicadas (master/master/worker1/worker1/...).
+#
+# Ejemplo de relabeling preservado en comentario por valor educativo
+# (el patrón en sí sigue siendo útil — solo no debe convivir con el
+# scrape auto). Si se reactiva, deshabilitar antes el discovery
+# automático del Service del node-exporter (annotation
+# prometheus.io/scrape=false en el Service, o filtrar el namespace
+# 'monitoring' en el job 'kubernetes-service-endpoints').
+#
+# extraScrapeConfigs: |
+#   - job_name: node-exporter-clean
+#     kubernetes_sd_configs:
+#       - role: endpoints
+#         namespaces:
+#           names: [monitoring]
+#     relabel_configs:
+#       # 1. Filtro: solo los endpoints del Service de node-exporter.
+#       - source_labels: [__meta_kubernetes_service_name]
+#         regex: prometheus-prometheus-node-exporter
+#         action: keep
+#       # 2. Copiar el nombre del nodo a un label visible 'node'.
+#       - source_labels: [__meta_kubernetes_pod_node_name]
+#         target_label: node

@@ -1,0 +1,16 @@
+# values/dvwa.yaml — overrides del chart custom charts/dvwa
+#
+# Como con suricata.yaml: el chart ya trae defaults del lab.
+# Este archivo solo declara lo "de entorno" — lo único que un operador
+# de paralelo-proyecto querría ajustar sin tocar el chart en sí.
+
+# Pin al worker concreto del lab.
+# OJO: el hostname Linux es 'worker1' (sin prefijo 'test-' que sí tiene
+# el nombre de la VM Vagrant). kubelet popula la label desde `hostname`.
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+# NodePort canónico del lab — coherente con el de proyecto/ original
+# para que cualquier playbook de Kali funcione en ambos.
+service:
+  nodePort: 30430

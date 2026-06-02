@@ -1,0 +1,100 @@
+# charts/webgoat/values.yaml
+#
+# Defaults del chart. Mismo pattern que charts/dvwa: portable aquí,
+# overrides "de entorno" (worker concreto, NodePort) en values/webgoat.yaml.
+
+image:
+  # webgoat/webgoat: imagen oficial OWASP. Java + Spring Boot autocontenido.
+  # Lleva WebGoat (puerto 8080) + WebWolf (puerto 9090) en el mismo container
+  # — son procesos hermanos lanzados por el ENTRYPOINT del jar.
+  repository: webgoat/webgoat
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Pin a worker1 — coherente con DVWA y Suricata. El IDS (Suricata)
+# captura el tráfico de eth0 del nodo donde corre, así que centralizar
+# todos los CMS vulnerables en worker1 simplifica detección.
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+tolerations: []
+
+# Service NodePort. 30380 elegido para coherencia con el lab proyecto/.
+# WebGoat (8080) sí se expone, WebWolf (9090) NO — queda interno.
+# Si en el futuro queremos atacar también WebWolf desde Kali, añadir
+# un segundo Service o expandir este con un puerto extra.
+service:
+  type: NodePort
+  port: 8080            # Puerto interno (Spring Boot WebGoat)
+  nodePort: 30380       # Puerto expuesto en el nodo
+  webwolfPort: 9090     # Solo expuesto vía ClusterIP (acceso desde dentro
+                        # del cluster con port-forward o curl interno)
+
+# WebGoat reset endpoint y URL — no es solo cosmético. WebGoat es muy
+# sensible al `host` que ve en los headers HTTP: si las URLs absolutas
+# que genera apuntan a `localhost` (default), los retos que requieren
+# que el browser navegue a otra ruta (como CSRF) fallan en silencio.
+# La env WEBGOAT_HOST=0.0.0.0 hace que escuche en todas las interfaces;
+# WEBGOAT_SERVER_DIRECTORY no es lo mismo (es para state on-disk).
+webgoat:
+  host: "0.0.0.0"      # bind a todas las interfaces, sin esto el container
+                       # solo escucha 127.0.0.1 y NodePort no llega
+  webwolfHost: "0.0.0.0"
+  # Path base — WebGoat es CASE-SENSITIVE: /WebGoat con W y G mayúsculas.
+  # Las redirects internas usan este path; cambiarlo aquí no lo cambia
+  # globalmente (hardcoded en el JAR), solo se usa para los probes.
+  contextPath: "/WebGoat"
+
+# Persistencia DESACTIVADA. WebGoat persiste el progreso de los retos
+# en una BD H2 embebida en /home/webgoat/.webgoat (UID 9001 por default).
+# Para un lab de detección de ataques, perder progreso entre restarts
+# es aceptable — lo que nos importa es que las firmas Suricata y reglas
+# Falco disparen contra peticiones reales de Kali.
+#
+# Si en el futuro quisiéramos persistir, hay que pre-crear /mnt/data/webgoat
+# con chown 9001:9001 (igual que el patrón Grafana UID 472).
+persistence:
+  enabled: false
+
+# Recursos. Lección crítica de proyecto/ original: WebGoat sin límites
+# de heap se come 1Gi+ de RAM y tira worker1. Acotamos JVM heap vía
+# JAVA_TOOL_OPTIONS al 75% del limit de container — Spring Boot + JIT
+# + metaspace + thread stacks ocupan ~100Mi adicionales fuera del heap.
+#
+# Con limits 512Mi: heap 384Mi → margen ~128Mi para JVM overhead.
+# CPU 600m: arranque de Spring Boot dura ~60-90s con un solo core.
+resources:
+  requests:
+    cpu: 150m
+    memory: 200Mi
+  limits:
+    cpu: 600m
+    memory: 512Mi
+
+# Java tuning. JAVA_TOOL_OPTIONS lo respeta cualquier JVM moderna
+# (lo lee desde el environment ANTES de parsear los args propios).
+# -Xmx384m  → heap máximo 384Mi (resto del limit para metaspace + nativo)
+# -Xms256m  → heap inicial 256Mi para no estresar al GC en los primeros
+#             minutos cuando hay pico de allocation por Spring init
+java:
+  toolOptions: "-Xmx384m -Xms256m"
+
+# Probes. WebGoat tarda mucho en arrancar (Spring Boot + classpath
+# scanning + H2 embedded init). En un nodo cargado puede llegar a 90s.
+#
+# /WebGoat/login.mvc es el endpoint canónico — devuelve 200 con el form
+# de login en cuanto Spring está listo, incluso sin autenticar.
+# Probar / lleva a 302 → /WebGoat/login.mvc (kubelet acepta 200-399).
+probes:
+  liveness:
+    path: /WebGoat/login.mvc
+    initialDelaySeconds: 120     # arranque cold + classpath scan
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /WebGoat/login.mvc
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 5
+    failureThreshold: 3

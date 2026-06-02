@@ -1,0 +1,21 @@
+apiVersion: v2
+name: dvwa
+description: |
+  DVWA (Damn Vulnerable Web Application) standalone para el lab paralelo-proyecto.
+  Deployment 1-replica en worker1, namespace 'vulnerable'. Imagen autocontenida
+  con MySQL embebido (vulnerables/web-dvwa) — un solo container, sin chart de
+  base de datos aparte. Service NodePort para acceso desde Kali (futuro).
+type: application
+
+# version = del CHART. appVersion = de la APP (DVWA upstream usa 'latest'
+# como tag canónico — no hay versionado semántico oficial publicado).
+version: 0.1.0
+appVersion: "latest"
+
+keywords:
+  - vulnerable
+  - lab
+  - dvwa
+  - security-testing
+maintainers:
+  - name: paralelo-proyecto

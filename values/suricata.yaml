@@ -1,0 +1,70 @@
+# values/suricata.yaml — overrides del chart custom charts/suricata
+#
+# Este chart es nuestro, así que los defaults en charts/suricata/values.yaml
+# ya reflejan las decisiones del lab. Este archivo existe por:
+#
+#   1) Consistencia con el resto del repo (grafana.yaml, prometheus.yaml, etc.
+#      todos viven en values/ aunque sean para charts upstream).
+#   2) Aislar overrides "de entorno" (cosas que cambiarían en otro lab)
+#      del chart, que es portable.
+#
+# Mantén aquí SOLO lo que es específico de paralelo-proyecto.
+# El resto de los defaults se heredan del chart.
+
+# Pin al hostname literal del worker1 de paralelo-proyecto.
+# OJO: kubelet popula 'kubernetes.io/hostname' con `hostname` del OS,
+# que en este lab es 'worker1' (sin prefijo). El prefijo 'test-' es
+# del nombre de la VM Vagrant, no del hostname Linux.
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+# Variables de red propias del lab.
+suricata:
+  # eth0 confirmado en worker1 (10.0.1.11/24, red red-prueba).
+  interface: eth0
+
+  # HOME_NET = qué considera Suricata "lo nuestro" (lo que defiende).
+  # Suricata clasifica cada paquete; las firmas ET Open están escritas como
+  # `alert ... ($EXTERNAL_NET any -> $HOME_NET any)`, así que solo disparan
+  # cuando origen ∈ EXTERNAL_NET y destino ∈ HOME_NET. EXTERNAL_NET está
+  # definido en el ConfigMap como "!$HOME_NET" (negación), así que reducir
+  # HOME_NET expande automáticamente quién cuenta como atacante.
+  #
+  # Hosts incluidos:
+  #   - 10.0.1.10/32    → test-master (control-plane k8s)
+  #   - 10.0.1.11/32    → test-worker1 (DVWA + Suricata — el target principal)
+  #   - 10.0.1.12/32    → test-worker2 (Grafana + Prometheus + Loki)
+  #   - 10.233.0.0/16   → pod+service CIDR de kubespray (tráfico interno cluster)
+  #
+  # DELIBERADAMENTE FUERA:
+  #   - 10.0.1.20       → Kali. Queremos que sea EXTERNAL_NET para que las
+  #                       firmas ET Open `$EXTERNAL_NET -> $HOME_NET` disparen
+  #                       contra ella. Si la metiéramos en HOME_NET (p.ej. con
+  #                       el viejo 10.0.1.0/24), Kali → worker1 sería
+  #                       HOME → HOME y la mayoría de firmas no matchearían
+  #                       silenciosamente (ningún error en logs, simplemente
+  #                       cero alertas).
+  homeNet: "[10.0.1.10/32,10.0.1.11/32,10.0.1.12/32,10.233.0.0/16]"
+
+# Override de recursos: el default del chart (limits 256Mi) estaba
+# dimensionado para Suricata "casi vacío" (~436 reglas built-in que
+# cargaba ANTES del fix del bug 'et/open' → URL directa). Con ET Open
+# completo descargado (~65k reglas, ~50k habilitadas), el detect-engine
+# construye un autómata Aho-Corasick en RAM cuyo pico transitorio supera
+# 256Mi → OOMKill (exit 137) ~30s tras arrancar.
+#
+# Verificado empíricamente: con 1Gi en limits el pod queda Ready y el
+# RSS estable en operación es ~300-500Mi. La brecha requests↔limits
+# permite burst durante el pattern-matcher build sin reservar RAM ociosa
+# permanentemente al pod.
+#
+# CPU: 500m basta para un IDS pasivo en un lab de baja carga (~1 worker
+# del pool autofp). En producción con tráfico real subiríamos a varios
+# cores y runmode=workers.
+resources:
+  requests:
+    cpu: 50m
+    memory: 200Mi
+  limits:
+    cpu: 500m
+    memory: 1Gi

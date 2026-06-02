@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dvwa.fullname" . }}
+  labels:
+    {{- include "dvwa.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      # nodePort solo aplica si type == NodePort. Lo dejamos siempre
+      # presente — si en el futuro se cambia el type a ClusterIP,
+      # k8s ignora silenciosamente este campo.
+      nodePort: {{ .Values.service.nodePort }}
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "dvwa.selectorLabels" . | nindent 4 }}

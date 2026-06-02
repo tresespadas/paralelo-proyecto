@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dvwa.fullname" . }}
+  labels:
+    {{- include "dvwa.labels" . | nindent 4 }}
+spec:
+  # 1 replica fija. DVWA con MySQL embebido NO escala — dos pods con el
+  # mismo PVC ReadWriteOnce darían lugar a ContainerCreating bloqueado
+  # en uno de ellos. Si queremos HA real, hay que partir Apache+MySQL
+  # en charts separados con MariaDB Statefulset, ReadWriteMany, etc.
+  # Para un lab de detección, 1 replica basta.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "dvwa.selectorLabels" . | nindent 6 }}
+  # strategy: Recreate — antes de arrancar el nuevo pod, mata el viejo.
+  # Necesario porque el PVC RWO no admite dos pods a la vez. Con 'RollingUpdate'
+  # (default), el nuevo pod queda en Pending hasta que el viejo libera el PVC,
+  # provocando downtime IGUAL pero con eventos más confusos.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "dvwa.selectorLabels" . | nindent 8 }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: dvwa
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          # Probes apuntando a /login.php (no a /):
+          # / responde 302 redirigiendo a /setup.php hasta que la BD se
+          # inicializa (proceso manual via UI). /login.php ya devuelve 200
+          # sin BD configurada, lo que evita que kubelet marque el pod
+          # como "ready" prematuramente o como "muerto" por 302.
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.persistence.enabled }}
+          volumeMounts:
+            - name: mysql-data
+              mountPath: {{ .Values.persistence.mountPath }}
+          {{- end }}
+      {{- if .Values.persistence.enabled }}
+      volumes:
+        - name: mysql-data
+          persistentVolumeClaim:
+            # PVC pre-creado fuera del chart (manifests/storage/dvwa-pv.yaml).
+            # Pattern coherente con grafana/prometheus/loki en este repo:
+            # los PV/PVC viven en manifests/storage/ y son aplicados por
+            # setup-security.sh ANTES del helm install, así el chart
+            # solo tiene que referenciarlos.
+            claimName: {{ .Values.persistence.existingClaim }}
+      {{- end }}

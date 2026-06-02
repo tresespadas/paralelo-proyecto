@@ -1,0 +1,331 @@
+\section{Fase 3 -- \emph{Stack} de monitorización}
+
+\subsection{Objetivo}
+
+Sobre el clúster desplegado en la Fase 2 se instala el \emph{stack} de observabilidad clásico de la comunidad cloud-native: \textbf{Prometheus} para métricas, \textbf{Loki} para \emph{logs}, \textbf{Grafana} como UI unificada, y \textbf{Promtail} como agente de \emph{shipping} de \emph{logs}. Todo se concentra físicamente en \texttt{test-worker2}, que aloja los \texttt{hostPath} de los tres servidores. La automatización completa vive en \texttt{scripts/setup-lab.sh}.
+
+\subsection{Arquitectura}
+
+\begin{center}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Componente} & \textbf{Despliegue} & \textbf{Nodo} & \textbf{Acceso} \\
+\hline
+Grafana       & \texttt{Deployment} (1 \emph{replica})       & worker2          & NodePort 30711 \\
+Prometheus    & \texttt{Deployment} (1 \emph{replica})       & worker2          & NodePort 30090 \\
+Loki          & \texttt{StatefulSet} (SingleBinary)          & worker2          & ClusterIP 3100 \\
+Promtail      & \texttt{DaemonSet} (sin master)              & worker1, worker2 & --- \\
+node-exporter & \texttt{DaemonSet}                           & los 3            & ClusterIP 9100 \\
+kube-state-metrics & \texttt{Deployment}                     & cualquier worker & ClusterIP 8080 \\
+\hline
+\end{tabular}
+\end{center}
+
+El flujo de datos es:
+
+\begin{itemize}
+  \item \textbf{Métricas}: node-exporter + kube-state-metrics $\to$ Prometheus (\emph{pull} cada 15\,s) $\to$ Grafana (consultas PromQL).
+  \item \textbf{Logs}: \texttt{/var/log/pods/*} $\to$ Promtail (\texttt{tail} en cada \emph{worker}) $\to$ Loki (push HTTP) $\to$ Grafana (consultas LogQL).
+\end{itemize}
+
+\subsection{Volúmenes persistentes vía \texttt{hostPath}}
+
+Los tres servidores (Grafana, Prometheus, Loki) usan \texttt{hostPath} en \texttt{/mnt/data/} de \texttt{test-worker2}. El disco persistente bajo \texttt{/mnt/data} es el qcow2 montado en Fase 1, que sobrevive a \texttt{vagrant destroy}. Eso permite mantener \emph{dashboards}, métricas e \emph{logs} históricos entre reconstrucciones completas del clúster.
+
+Los PV se definen estáticamente en \texttt{manifests/storage/}:
+
+\begin{lstlisting}[style=yaml]
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: grafana-pv
+spec:
+  capacity:    { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /mnt/data/grafana
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: monitoring
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  resources: { requests: { storage: 1Gi } }
+  volumeName: grafana-pv
+\end{lstlisting}
+
+El \texttt{volumeName: grafana-pv} en el PVC fuerza el \emph{binding} \textbf{estático} con el PV concreto (en vez del \emph{binding} dinámico por \texttt{StorageClass}, que aquí no aplica porque ambos tienen \texttt{storageClassName: ""}).
+
+\paragraph{Caso especial Loki.} El PV de Loki se declara \emph{sin} su PVC: Loki corre como \texttt{StatefulSet} y el \emph{chart} genera el PVC automáticamente vía \texttt{volumeClaimTemplates} con el nombre \texttt{storage-loki-0}. El \emph{binding} ocurre por \emph{matching} de \texttt{capacity}, \texttt{accessModes} y \texttt{storageClassName}, no por \texttt{volumeName} explícito.
+
+\paragraph{Permisos \texttt{chown}.} Antes de cualquier \texttt{helm install}, el \emph{script} entra por SSH a worker2 y hace:
+
+\begin{lstlisting}[style=bash]
+sudo mkdir -p /mnt/data/grafana /mnt/data/prometheus /mnt/data/loki
+sudo chown 472:472     /mnt/data/grafana       # UID 'grafana' en la imagen
+sudo chown 65534:65534 /mnt/data/prometheus    # UID 'nobody'
+sudo chown 10001:10001 /mnt/data/loki          # UID del podSecurityContext del chart
+\end{lstlisting}
+
+Esto es \textbf{obligatorio}. \texttt{fsGroup} en el \texttt{podSecurityContext} \emph{no recursiza sobre \texttt{hostPath}}, así que el \texttt{chown} a posteriori (o por un \emph{init container} \texttt{busybox}) es la única manera de que el proceso del contenedor (no privilegiado) pueda escribir. En los tres \emph{charts} desactivamos el \texttt{initChownData} para no depender del \emph{pull} de \texttt{docker.io/library/busybox} desde el registro público.
+
+\subsection{Grafana}
+
+\subsubsection{Despliegue}
+
+Se instala con el \emph{chart} oficial \texttt{grafana/grafana}. Los \texttt{values} relevantes:
+
+\begin{lstlisting}[style=yaml]
+adminUser: admin
+adminPassword: admin
+persistence:
+  enabled: true
+  existingClaim: grafana-pvc
+service:
+  type: NodePort
+  nodePort: 30711
+nodeSelector:
+  kubernetes.io/hostname: worker2
+initChownData:
+  enabled: false
+\end{lstlisting}
+
+\subsubsection{Provisioning declarativo de \emph{datasources}}
+
+En lugar de cablear los \emph{datasources} contra la API de Grafana \emph{a posteriori} (\texttt{POST /api/datasources}), se declaran dentro del propio \texttt{values.yaml}:
+
+\begin{lstlisting}[style=yaml]
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    deleteDatasources:
+      - { name: Prometheus, orgId: 1 }
+      - { name: Loki,       orgId: 1 }
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-server.monitoring.svc.cluster.local
+        isDefault: true
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki.monitoring.svc.cluster.local:3100
+\end{lstlisting}
+
+El \emph{chart} genera un \texttt{ConfigMap} con este archivo y lo monta en \texttt{/etc/grafana/provisioning/datasources/}. Grafana lo lee al arrancar el pod y reconcilia. Ventajas: versionado en \emph{git} (\emph{single source of truth}), idempotente, los \emph{datasources} aparecen marcados como \emph{Provisioned} en la UI con candado de solo lectura.
+
+\paragraph{El bloque \texttt{deleteDatasources} (defensivo).} Una de las lecciones más importantes del proyecto. El \emph{flow} de fallo es:
+
+\begin{enumerate}
+  \item Primer \emph{install} sin \texttt{uid:} explícito $\to$ Grafana asigna UUIDs aleatorios y los persiste en la \emph{sqlite} del PVC.
+  \item Se introduce \texttt{uid: prometheus} / \texttt{uid: loki} en una segunda iteración.
+  \item Al rearrancar el pod, el \emph{provisioner} busca por \texttt{uid} $\to$ no encuentra (la entrada vieja tiene UUID diferente) $\to$ intenta \emph{insert} $\to$ colisiona por \emph{unique constraint} en \texttt{(name)} $\to$ \texttt{CrashLoopBackOff} con \emph{logs} crípticos: \emph{``data source not found''}.
+\end{enumerate}
+
+\texttt{deleteDatasources} se ejecuta \emph{antes} del bloque \texttt{datasources} en cada arranque, borrando por \texttt{(name, orgId)}. En arranques posteriores el \texttt{delete} es \emph{no-op} (la entrada ya está alineada al \texttt{uid} declarado) y el \texttt{insert} reaplica los mismos valores. Coste: un par de líneas en \emph{logs} por arranque. Beneficio: el pod nunca queda atrapado en \texttt{CrashLoopBackOff} por una \emph{sqlite} heredada con UIDs inconsistentes.
+
+\subsubsection{Provisioning declarativo de \emph{dashboards}}
+
+Mismo patrón aplicado a \emph{dashboards}: se declaran en el \texttt{values.yaml} y el \emph{chart} genera un \texttt{ConfigMap} por \emph{dashboard}. El \emph{sidecar} \texttt{kiwigrid/k8s-sidecar} inyectado por el \emph{chart} monta el \texttt{ConfigMap} en \texttt{/var/lib/grafana/dashboards/<provider>/} y Grafana los carga al arrancar.
+
+\begin{lstlisting}[style=yaml]
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: 'lab'
+        orgId: 1
+        folder: 'Lab'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/lab
+
+dashboards:
+  lab:
+    security-overview:
+      json: |
+        { ... JSON inline del dashboard ... }
+\end{lstlisting}
+
+El \emph{dashboard} \texttt{security-overview} (15 paneles) reúne en una sola vista las métricas de Prometheus (CPU/memoria/red/disco por nodo, filesystem \%) y los \emph{logs} de Loki (eventos Falco y Suricata, top firmas, tráfico por CMS), todos referenciados por \texttt{uid: prometheus} / \texttt{uid: loki} para que el \emph{provisioning} reproduzca el \emph{dashboard} con \emph{datasources} estables.
+
+\paragraph{Paneles ``\% por nodo''.} Las queries de los paneles \emph{multi-nodo} usan \texttt{avg by (node) (\dots)} en vez de \texttt{by (node)} a secas. Es una defensa preventiva: si un \emph{rollout} o un cambio de \emph{scrape} deja series duplicadas temporalmente (mismo nodo, distintos labels de \emph{job}), \texttt{avg by} las colapsa en una sola línea. Sin sesgo cuando los valores son idénticos, evita el artefacto visual de ver \emph{``master/master/worker1/worker1/\dots''} en la leyenda durante los 5 minutos de \emph{staleness} de la TSDB.
+
+\subsection{Prometheus}
+
+Se instala con el \emph{chart} \texttt{prometheus-community/prometheus} en \emph{scope medium}: solo servidor + node-exporter + kube-state-metrics. Alertmanager y Pushgateway desactivados.
+
+\begin{lstlisting}[style=yaml]
+server:
+  persistentVolume:
+    enabled: true
+    existingClaim: prometheus-pvc
+  initChownData:
+    enabled: false
+  service:
+    type: NodePort
+    nodePort: 30090
+  nodeSelector:
+    kubernetes.io/hostname: worker2
+  retention: "7d"
+alertmanager:
+  enabled: false
+prometheus-pushgateway:
+  enabled: false
+\end{lstlisting}
+
+\paragraph{El bug del \emph{doble \emph{scrape}}.} Una de las gotchas más sutiles del proyecto. El \emph{chart} de Prometheus incluye por defecto el \emph{job} \texttt{kubernetes-service-endpoints}, que auto-descubre cualquier \texttt{Service} con la anotación \texttt{prometheus.io/scrape=true}. El \texttt{Service} del node-exporter ya trae esa anotación, así que se \emph{scrappea} automáticamente.
+
+Si además se declara un \texttt{extraScrapeConfigs} personalizado para \emph{relabel} (por ejemplo, exponer \texttt{\_\_meta\_kubernetes\_pod\_node\_name} como \texttt{node}), el mismo endpoint \texttt{:9100} se \emph{scrappea dos veces} --- una por cada \emph{job} --- y la TSDB acaba con dos series con labels distintos pero valores casi idénticos. El síntoma en Grafana son leyendas duplicadas (\texttt{master/master/worker1/worker1/\dots}) durante los $\sim$5\,min de retención de \emph{staleness} de Prometheus.
+
+\paragraph{Solución adoptada.} Eliminar \texttt{extraScrapeConfigs} y dejar solo el \emph{auto-discovery}, que ya hace el \emph{relabel} de \texttt{node} en versiones recientes del \emph{chart}. El bloque se conserva como comentario en el \texttt{values.yaml} con valor pedagógico:
+
+\begin{lstlisting}[style=bash]
+# extraScrapeConfigs: |
+#   - job_name: node-exporter-clean
+#     kubernetes_sd_configs:
+#       - role: endpoints
+#         namespaces: { names: [monitoring] }
+#     relabel_configs:
+#       - source_labels: [__meta_kubernetes_service_name]
+#         regex: prometheus-prometheus-node-exporter
+#         action: keep
+#       - source_labels: [__meta_kubernetes_pod_node_name]
+#         target_label: node
+\end{lstlisting}
+
+\paragraph{Gotcha \texttt{extraScrapeConfigs} es \emph{top-level}.} La estructura del \emph{chart} pone esta clave a nivel \emph{root}, no bajo \texttt{server:}. Helm la ignora silenciosamente si está mal anidada: el \texttt{ConfigMap} renderizado no la contiene, no hay error, y el operador descubre que falta solo al ver que el \emph{job} nunca aparece en \texttt{/targets} de la UI de Prometheus.
+
+\subsection{Loki}
+
+Loki es el componente más sensible a tunear del \emph{stack}. Se instala con el \emph{chart} oficial \texttt{grafana/loki} en modo \texttt{SingleBinary}.
+
+\subsubsection{Modo \texttt{SingleBinary}}
+
+Es el \emph{único} modo compatible con \emph{filesystem storage}. \texttt{Simple Scalable} y \texttt{Distributed} requieren \emph{object storage} (S3/GCS/MinIO) por restricción explícita del \emph{chart}. Como en este \emph{lab} solo tenemos \texttt{hostPath} en worker2, no es una decisión de simplicidad pedagógica: es una restricción técnica.
+
+\subsubsection{Configuración base}
+
+\begin{lstlisting}[style=yaml]
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2024-04-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index: { prefix: loki_index_, period: 24h }
+\end{lstlisting}
+
+\subsubsection{\emph{Sizing} bajo \emph{pen-test flood}}
+
+Una lección concreta del proyecto: con los \emph{defaults} del \emph{chart} (\texttt{limits.memory: 256Mi}), Loki entra en \emph{OOMKill loop} durante un \emph{pen-test} simulado (\texttt{nikto + gobuster + sqlmap} en paralelo contra los tres CMS, $\sim$500 eventos/s). Los \emph{limits} subidos a 768\,Mi cubren el escenario peor:
+
+\begin{lstlisting}[style=yaml]
+singleBinary:
+  resources:
+    requests: { cpu: 50m,  memory: 256Mi }
+    limits:   { cpu: 500m, memory: 768Mi }
+\end{lstlisting}
+
+La RAM se consume en:
+\begin{itemize}
+  \item \emph{ingest buffers} y escrituras al WAL.
+  \item Decompresión de \emph{chunks} durante las queries del \emph{dashboard} (auto-refresh cada 5\,s).
+  \item Pattern matching con \texttt{label\_format} / \texttt{hasPrefix} (paneles de status codes y top URIs).
+\end{itemize}
+
+\subsubsection{Tamaño máximo de mensaje gRPC}
+
+\begin{lstlisting}[style=yaml]
+loki:
+  server:
+    grpc_server_max_recv_msg_size: 33554432    # 32 MiB
+    grpc_server_max_send_msg_size: 33554432
+    http_server_read_timeout: 60s
+    http_server_write_timeout: 60s
+\end{lstlisting}
+
+El \emph{default} es 4\,MB. Bajo \emph{flood}, las queries del \emph{dashboard} (\texttt{count\_over\_time}, \texttt{topk}) devuelven \emph{payloads} \textgreater\,10\,MB que rompen el bus gRPC interno con un error críptico (\emph{``grpc: received message larger than max''}). 32\,MiB cubre con margen.
+
+\subsubsection{Límites de \emph{query}}
+
+\begin{lstlisting}[style=yaml]
+loki:
+  limits_config:
+    retention_period: 168h            # 7 dias, coherente con Prometheus
+    split_queries_by_interval: 15m
+    max_query_series: 5000
+    max_entries_limit_per_query: 5000
+\end{lstlisting}
+
+\texttt{split\_queries\_by\_interval} parte queries grandes en ventanas de 15 minutos que se ejecutan en paralelo internamente. Una query de 1 hora se vuelve 4 sub-queries más manejables, lo que evita picos de RAM transitorios al decomprimir un \emph{chunk} entero.
+
+\subsection{Promtail}
+
+Promtail corre como \texttt{DaemonSet} en worker1 + worker2 (master excluido por \texttt{tolerations: []}). Lee de \texttt{/var/log/pods/*} en cada nodo y hace \emph{push} HTTP a Loki.
+
+\begin{lstlisting}[style=yaml]
+config:
+  clients:
+    - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+tolerations: []
+serviceMonitor:
+  enabled: false
+\end{lstlisting}
+
+\paragraph{El \emph{override} crítico de la URL.} El \emph{default} del \emph{chart} apunta a \texttt{http://loki-gateway/\dots} (el \texttt{nginx} \emph{reverse proxy} del \emph{chart} de Loki). Pero en nuestra instalación \texttt{gateway.enabled: false}, así que el \texttt{Service} \texttt{loki-gateway} no existe y Promtail entra en bucle de \emph{retries}. Apuntando directo al \texttt{Service} \texttt{loki} se evita el salto intermedio.
+
+\paragraph{\texttt{serviceMonitor: false}.} El recurso \texttt{ServiceMonitor} pertenece al \emph{Prometheus Operator} (CRD del \emph{chart} \texttt{kube-prometheus-stack}). Aquí usamos Prometheus \emph{standalone}, que no instala ese CRD. Si dejásemos \texttt{serviceMonitor.enabled: true} (el \emph{default}), el \emph{chart} intentaría crear el recurso y \texttt{helm} fallaría con \emph{``no matches for kind ServiceMonitor''}.
+
+\paragraph{Deprecation.} El \emph{chart} \texttt{grafana/promtail} está marcado como \emph{deprecated} a favor de \texttt{grafana/alloy}. La decisión consciente fue mantener Promtail por ahora: el coste de migrar a Alloy en mitad del proyecto formativo es mayor que el beneficio (mismo \emph{output} a Loki, distinta sintaxis de \emph{pipeline}). Migración prevista para una segunda iteración del laboratorio.
+
+\subsection{Convención de \emph{labels} en LogQL}
+
+Promtail con la configuración del \emph{chart} genera \emph{labels} cortos:
+
+\begin{itemize}
+  \item \texttt{namespace} (no \texttt{kubernetes\_namespace}).
+  \item \texttt{app} (no \texttt{app.kubernetes.io/name} ni \texttt{kubernetes\_pod\_label\_app}).
+  \item \texttt{pod}, \texttt{container}, \texttt{node}.
+\end{itemize}
+
+Esto es deliberado: \emph{labels} cortos son más legibles en queries LogQL y reducen cardinalidad de \emph{stream}. Las queries canónicas del \emph{dashboard} terminan siendo del estilo:
+
+\begin{lstlisting}[style=bash]
+{namespace="security", app="falco"}    | json | rule = "Terminal shell in container"
+{namespace="security", app="suricata"} | json | event_type = "alert"
+\end{lstlisting}
+
+\subsection{El \emph{script} \texttt{setup-lab.sh}}
+
+Orquesta todo lo anterior en 8 fases idempotentes con \texttt{helm upgrade -{}-install -{}-wait}. Recupera la contraseña real del \texttt{admin} de Grafana desde el \texttt{Secret} (\texttt{helm} no rota \texttt{Secrets} en \emph{upgrades}, así que el \texttt{values.yaml} solo aplica al primer \emph{install}). Endpoints finales:
+
+\begin{lstlisting}[style=bash]
+Grafana:    http://10.0.1.12:30711   (admin / admin)
+Prometheus: http://10.0.1.12:30090
+Loki:       solo interno (http://loki.monitoring.svc.cluster.local:3100)
+\end{lstlisting}
+
+Invocación:
+
+\begin{lstlisting}[style=bash]
+vagrant provision test-master --provision-with setup-lab
+\end{lstlisting}

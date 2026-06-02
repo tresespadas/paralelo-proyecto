@@ -1,0 +1,13 @@
+# values/webgoat.yaml — overrides del chart custom charts/webgoat
+#
+# Pattern coherente con values/dvwa.yaml: solo declara lo "de entorno"
+# (worker concreto, NodePort específico). Lo portable está en charts/.
+
+# Pin al worker concreto del lab.
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+# NodePort del lab — coherente con el de proyecto/ original
+# para que cualquier playbook contra WebGoat funcione en ambos.
+service:
+  nodePort: 30380

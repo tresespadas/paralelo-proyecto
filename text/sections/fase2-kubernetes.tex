@@ -1,0 +1,182 @@
+\section{Fase 2 -- Despliegue del clúster Kubernetes}
+
+\subsection{Objetivo}
+
+Sobre las tres VMs aprovisionadas en la Fase 1 se despliega un clúster Kubernetes de tres nodos (un \emph{control-plane} y dos \emph{workers}) usando \textbf{Kubespray} v2.26.0. El resultado es un clúster Kubernetes v1.30.4 con CNI Flannel, container runtime \texttt{containerd} y etcd \emph{stacked} (corriendo en el mismo \emph{control-plane}). Toda la fase se ejecuta desde \texttt{test-master} de forma idempotente mediante el \emph{script} \texttt{scripts/setup-kubespray.sh}.
+
+\subsection{Por qué Kubespray}
+
+Las alternativas evaluadas fueron:
+
+\begin{itemize}
+  \item \textbf{kubeadm} (oficial, manual): requiere \emph{bootstrap} explícito por nodo. Para tres nodos es razonable, pero la curva de mantenimiento es alta cuando hay que cambiar versión o re-aplicar configuración.
+  \item \textbf{k3s}: distribución \emph{lightweight} con un único binario. Excelente para edge, pero esconde decisiones (etcd reemplazado por SQLite por defecto, CNI customizado) que en un proyecto formativo conviene mantener visibles.
+  \item \textbf{Kubespray} (elegida): \emph{collection} de Ansible mantenida por SIGs de Kubernetes. Despliega Kubernetes \emph{vanilla} \emph{upstream} con componentes intercambiables vía variables. La curva de aprendizaje de Ansible se rentabiliza por la trazabilidad (cada cambio de versión es un \texttt{git checkout} y un \emph{re-run}).
+\end{itemize}
+
+\subsection{Estructura del \emph{script} \texttt{setup-kubespray.sh}}
+
+El \emph{script} se ejecuta como \emph{provisioner shell} en \texttt{test-master} con \texttt{privileged: false} (es decir, como usuario \texttt{vagrant}) y \emph{re-execs} a sí mismo como el usuario personalizado \texttt{master} mediante:
+
+\begin{lstlisting}[style=bash]
+if [ "$(id -un)" != "master" ]; then
+  chmod a+r "$0"
+  exec sudo -iu master bash "$0" "$@"
+fi
+\end{lstlisting}
+
+Esto resulta en que todo el estado (\texttt{\textasciitilde/kubespray}, \texttt{\textasciitilde/kubespray-venv}, \texttt{\textasciitilde/.kube/config}) queda en \texttt{/home/master/}, no en \texttt{/home/vagrant/}. El \texttt{chmod a+r} previo es necesario porque Vagrant sube el \emph{script} a \texttt{/tmp} con modo \texttt{700} de propietario \texttt{vagrant}; sin ese permiso, \texttt{master} no podría siquiera leerlo.
+
+El \emph{script} se organiza en seis fases idempotentes.
+
+\subsubsection{Fase 1: Clonado de Kubespray}
+
+\begin{lstlisting}[style=bash]
+KUBESPRAY_TAG="v2.26.0"
+git clone --branch "$KUBESPRAY_TAG" --depth 1 \
+  https://github.com/kubernetes-sigs/kubespray.git $HOME/kubespray
+\end{lstlisting}
+
+Se fija una versión concreta (\texttt{v2.26.0}, que despliega Kubernetes 1.30.4) en lugar de \texttt{master}. Si en una segunda ejecución el directorio ya existe, el \emph{script} hace \texttt{fetch -{}-tags + checkout} sobre el tag fijado --- garantiza que la versión usada es siempre la misma.
+
+\subsubsection{Fase 2: Entorno virtual de Python}
+
+Kubespray requiere Ansible y un conjunto de dependencias Python específicas. Para no contaminar el Python del sistema:
+
+\begin{lstlisting}[style=bash]
+python3 -m venv $HOME/kubespray-venv
+source $HOME/kubespray-venv/bin/activate
+pip install -q -U pip
+pip install -q -r $HOME/kubespray/requirements.txt
+\end{lstlisting}
+
+\subsubsection{Fase 3: Generación del inventario}
+
+El inventario \texttt{hosts.yml} se escribe \emph{inline} mediante \emph{heredoc}, no copiando \texttt{inventory/sample}. La razón es que cada host declara su \texttt{ansible\_user} explícito (\texttt{master}, \texttt{worker1}, \texttt{worker2}) en vez de un usuario global vía \texttt{-{}-user}. Esto evita conflictos cuando Ansible necesita conectar con diferentes usuarios según el nodo.
+
+\begin{lstlisting}[style=bash]
+all:
+  hosts:
+    master:
+      ansible_host: 10.0.1.10
+      ansible_user: master
+      ip: 10.0.1.10
+      access_ip: 10.0.1.10
+    worker1:
+      ansible_host: 10.0.1.11
+      ansible_user: worker1
+      ip: 10.0.1.11
+      access_ip: 10.0.1.11
+    worker2:
+      ansible_host: 10.0.1.12
+      ansible_user: worker2
+      ip: 10.0.1.12
+      access_ip: 10.0.1.12
+  children:
+    kube_control_plane:
+      hosts: { master: }
+    kube_node:
+      hosts: { worker1:, worker2: }
+    etcd:
+      hosts: { master: }
+    k8s_cluster:
+      children:
+        kube_control_plane:
+        kube_node:
+    calico_rr:
+      hosts: {}
+\end{lstlisting}
+
+Los grupos \texttt{kube\_control\_plane}, \texttt{kube\_node}, \texttt{etcd} son nombres que Kubespray usa internamente para decidir qué roles aplicar a qué hosts. \texttt{calico\_rr} se declara vacío porque no usamos Calico Route Reflectors.
+
+\subsubsection{Fase 4: Configuración de \texttt{group\_vars}}
+
+\begin{lstlisting}[style=bash]
+cp -r $HOME/kubespray/inventory/sample/group_vars/. \
+      $HOME/kubespray/inventory/cluster-k8-paralelo/group_vars/
+sed -i 's/^kube_network_plugin:.*/kube_network_plugin: flannel/' \
+  $HOME/kubespray/inventory/cluster-k8-paralelo/group_vars/k8s_cluster/k8s-cluster.yml
+\end{lstlisting}
+
+Se copia el \texttt{group\_vars} de muestra y se sustituye el CNI por \textbf{flannel}. El \emph{default} de Kubespray es Calico, pero Flannel es más ligero y suficiente para un laboratorio: VXLAN sobre la red privada de libvirt, sin policies de red (que tampoco usaríamos en este proyecto).
+
+\subsubsection{Fase 5: Ejecución del \emph{playbook}}
+
+\begin{lstlisting}[style=bash]
+cd $HOME/kubespray
+ansible-playbook -i inventory/cluster-k8-paralelo/hosts.yml --become cluster.yml
+\end{lstlisting}
+
+El despliegue completo dura entre 8 y 12 minutos. Se ejecuta con \texttt{-{}-become} para que Ansible escale a \texttt{root} en los \emph{workers} cuando lo necesite (instalación de paquetes, configuración de \texttt{containerd}, etc.) --- recordemos que los tres usuarios personalizados están configurados con \texttt{sudo NOPASSWD} en \texttt{ssh-setup.sh}.
+
+\subsubsection{Fase 6: Instalación de \texttt{kubeconfig}}
+
+\begin{lstlisting}[style=bash]
+mkdir -p $HOME/.kube
+sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+\end{lstlisting}
+
+Kubespray escribe el \texttt{kubeconfig} del clúster en \texttt{/etc/kubernetes/admin.conf} (propiedad de \texttt{root}). Lo copiamos al \texttt{\textasciitilde/.kube/config} del usuario \texttt{master} y le cambiamos el propietario para que \texttt{kubectl} funcione sin \texttt{sudo}.
+
+\subsubsection{Fase 7: Creación de \emph{namespaces}}
+
+Antes de salir, el \emph{script} crea los tres \emph{namespaces} que usarán las fases posteriores:
+
+\begin{lstlisting}[style=bash]
+kubectl create namespace vulnerable
+kubectl create namespace monitoring
+kubectl create namespace security
+\end{lstlisting}
+
+Aislamiento por dominio:
+\begin{itemize}
+  \item \texttt{monitoring}: Grafana, Prometheus, Loki, Promtail.
+  \item \texttt{security}: Falco, Suricata.
+  \item \texttt{vulnerable}: DVWA, WebGoat, Juice Shop.
+\end{itemize}
+
+La separación \texttt{security} $\leftrightarrow$ \texttt{vulnerable} es deliberada: si un compromiso de DVWA escala fuera del pod, no debe ver los \emph{logs} de Falco y Suricata. En el lab no aplicamos NetworkPolicies (Flannel no las soporta sin un \emph{plugin} adicional), pero la separación lógica ya facilita una transición futura a Calico.
+
+\subsection{Validación post-despliegue}
+
+Tras la ejecución, los comandos esperables:
+
+\begin{lstlisting}[style=bash]
+$ kubectl get nodes
+NAME      STATUS   ROLES           AGE   VERSION
+master    Ready    control-plane   2m    v1.30.4
+worker1   Ready    <none>          1m    v1.30.4
+worker2   Ready    <none>          1m    v1.30.4
+
+$ kubectl get pods -A
+NAMESPACE     NAME                              READY   STATUS
+kube-system   kube-flannel-...                  1/1     Running
+kube-system   kube-proxy-...                    1/1     Running
+kube-system   coredns-...                       1/1     Running
+kube-system   nodelocaldns-...                  1/1     Running
+\end{lstlisting}
+
+\subsection{Lecciones y \emph{gotchas} encontradas}
+
+\subsubsection{Re-exec a usuario \texttt{master} con \texttt{chmod a+r}}
+
+Vagrant sube el \emph{script} a \texttt{/tmp/vagrant-shell} con modo \texttt{700} y propietario \texttt{vagrant}. Si el \emph{script} hace \texttt{exec sudo -iu master bash "\$0"} sin antes ampliar permisos, el \emph{exec} falla porque \texttt{master} no puede leer el archivo. La línea \texttt{chmod a+r "\$0"} resuelve el problema y es segura: el archivo está bajo \texttt{/tmp}, propiedad de \texttt{vagrant}, y dejar lectura abierta no expone secretos del repositorio.
+
+\subsubsection{Per-host \texttt{ansible\_user}}
+
+Inicialmente la tentación es pasar \texttt{-{}-user master} a \texttt{ansible-playbook} --- es lo que sale en la mayoría de tutoriales. El problema es que el SSH desde \texttt{master} (donde corre Ansible) hacia los \emph{workers} debe usar \texttt{worker1} y \texttt{worker2} como usuarios, no \texttt{master}. La solución elegante es declarar \texttt{ansible\_user} \emph{por host} en \texttt{hosts.yml} y no pasar \texttt{-{}-user} globalmente.
+
+\subsubsection{Inter-node SSH \emph{passwordless}}
+
+Kubespray funciona porque \texttt{ssh-setup.sh} ya ha pre-instalado la clave compartida del lab en \texttt{authorized\_keys} de los tres usuarios. Si esa clave no estuviera en \texttt{master $\to$ worker1} y \texttt{master $\to$ worker2}, Ansible quedaría esperando interactivamente la contraseña --- y el \emph{provisioner} fallaría sin pista clara del motivo.
+
+\subsubsection{Idempotencia del clúster}
+
+Re-ejecutar \texttt{setup-kubespray.sh} sobre un clúster ya desplegado es seguro: \texttt{git fetch \&\& checkout} es \emph{no-op} si ya está en el tag; \texttt{python -m venv} respeta el directorio existente; \texttt{kubectl create namespace} fallaría con \texttt{AlreadyExists}, pero el patrón canónico es:
+
+\begin{lstlisting}[style=bash]
+kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+\end{lstlisting}
+
+Este patrón se usa en \texttt{setup-security.sh} (Fase 4) para asegurar \emph{namespaces} de forma idempotente sin enmascarar errores genuinos con \texttt{|| true}.

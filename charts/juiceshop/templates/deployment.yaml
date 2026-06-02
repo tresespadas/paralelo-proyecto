@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "juiceshop.fullname" . }}
+  labels:
+    {{- include "juiceshop.labels" . | nindent 4 }}
+spec:
+  # 1 replica fija. Juice Shop guarda state en sqlite local (/juice-shop/data/).
+  # Múltiples replicas verían cada una su propia sqlite — sesiones, usuarios
+  # y retos completados quedarían inconsistentes entre pods. Si el lab
+  # crece a varios atacantes en paralelo, hay que migrar a Postgres externo
+  # vía DB_OPTIONS (Juice Shop soporta sequelize con varios dialects).
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "juiceshop.selectorLabels" . | nindent 6 }}
+  # Recreate por consistencia con charts/dvwa y charts/webgoat — ninguno
+  # tolera dos pods compartiendo el filesystem efímero del CMS.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "juiceshop.selectorLabels" . | nindent 8 }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: juiceshop
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          # NODE_ENV no se setea explícitamente — la imagen oficial ya
+          # arranca en mode production por defecto. Si quisiéramos
+          # forzar config alternativa, se haría con CTF_KEY o NODE_ENV=ctf
+          # para activar challenges-only mode.
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

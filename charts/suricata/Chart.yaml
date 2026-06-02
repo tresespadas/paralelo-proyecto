@@ -1,0 +1,22 @@
+apiVersion: v2
+name: suricata
+description: |
+  Suricata IDS standalone para el lab paralelo-proyecto.
+  DaemonSet con hostNetwork en worker1 (donde corre DVWA), capturando
+  tráfico de eth0 con af-packet. Reglas ET Open descargadas por
+  initContainer (suricata-update). Logs eve.json shipped via sidecar
+  tail → stdout → Promtail → Loki.
+type: application
+
+# version = del CHART (este YAML).
+# appVersion = de la APP (Suricata) — usamos 'latest' porque la imagen
+# jasonish/suricata:latest se pinea por digest en values, no por tag.
+version: 0.1.0
+appVersion: "latest"
+
+keywords:
+  - ids
+  - security
+  - lab
+maintainers:
+  - name: paralelo-proyecto

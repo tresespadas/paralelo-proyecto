@@ -1,0 +1,167 @@
+{{/*
+ConfigMap con suricata.yaml (config principal) y update.yaml (config de
+suricata-update). Ambos se montan en el pod como /etc/suricata/.
+
+Decisión: minimalismo. La config oficial de Suricata tiene ~1000 líneas
+con cientos de directivas; aquí solo declaramos lo que difiere del default.
+Suricata aplica defaults razonables a todo lo demás.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "suricata.fullname" . }}-config
+  labels:
+    {{- include "suricata.labels" . | nindent 4 }}
+data:
+  suricata.yaml: |
+    %YAML 1.1
+    ---
+    # Variables de red usadas por las reglas. ET Open mete la mayoría
+    # de sus condiciones en términos de $HOME_NET y $EXTERNAL_NET.
+    vars:
+      address-groups:
+        HOME_NET: "{{ .Values.suricata.homeNet }}"
+        EXTERNAL_NET: "!$HOME_NET"
+        HTTP_SERVERS: "$HOME_NET"
+        SQL_SERVERS: "$HOME_NET"
+        DNS_SERVERS: "$HOME_NET"
+        TELNET_SERVERS: "$HOME_NET"
+        AIM_SERVERS: "$EXTERNAL_NET"
+        DC_SERVERS: "$HOME_NET"
+        DNP3_SERVER: "$HOME_NET"
+        DNP3_CLIENT: "$HOME_NET"
+        MODBUS_CLIENT: "$HOME_NET"
+        MODBUS_SERVER: "$HOME_NET"
+        ENIP_CLIENT: "$HOME_NET"
+        ENIP_SERVER: "$HOME_NET"
+      port-groups:
+        # HTTP_PORTS render: lista en values → join "," → "80,30430,30380,31592".
+        # Cualquier NodePort de los CMS vulnerables debe estar aquí; si no,
+        # las firmas ET WEB_SERVER no clasifican el flujo como HTTP y se
+        # quedan en silencio (sin error, simplemente cero alertas web).
+        HTTP_PORTS: "{{ join "," .Values.suricata.httpPorts }}"
+        SHELLCODE_PORTS: "!80"
+        ORACLE_PORTS: 1521
+        SSH_PORTS: 22
+        DNP3_PORTS: 20000
+        MODBUS_PORTS: 502
+        FILE_DATA_PORTS: "[$HTTP_PORTS,110,143]"
+        FTP_PORTS: 21
+        GENEVE_PORTS: 6081
+        VXLAN_PORTS: 4789
+        TEAMSPEAK_PORTS: 10011
+
+    # Directorios estándar dentro de la imagen jasonish/suricata.
+    default-log-dir: /var/log/suricata
+    default-rule-path: /var/lib/suricata/rules
+    rule-files:
+      - suricata.rules    # Compilado por suricata-update en initContainer
+
+    # Outputs habilitados. EVE JSON es EL output que nos importa —
+    # estructurado, parsable por Loki con `| json`.
+    outputs:
+      # 1) eve.json — un evento por línea, JSON estructurado.
+      - eve-log:
+          enabled: yes
+          filetype: regular
+          filename: eve.json
+          types:
+            - alert:
+                payload: no              # No incluir payload binario en el log
+                payload-printable: yes   # Sí incluir versión legible (truncada)
+                packet: no
+                http-body: no
+                metadata: yes
+                tagged-packets: yes
+            - http:
+                extended: yes            # Headers, user-agent, referer
+            - dns:
+                version: 2
+            - tls:
+                extended: yes
+            - flow                       # Resumen de cada flujo TCP/UDP
+            # NB: NO incluir 'stats' aquí mientras el módulo global
+            # 'outputs.stats.enabled' esté en 'no' — Suricata aborta el
+            # arranque con "stats are disabled globally". Coherencia
+            # entre el sub-output de eve-log y el output principal.
+
+      # 2) fast.log — alertas en formato de una línea, legible humano.
+      # Útil para `kubectl exec ... -- tail -f` sin parsear JSON.
+      - fast:
+          enabled: yes
+          filename: fast.log
+
+      # 3) stats.log — DESACTIVADO. eve-log ya emite stats.
+      - stats:
+          enabled: no
+
+    # Logging del proceso Suricata (no de eventos detectados).
+    logging:
+      default-log-level: {{ .Values.suricata.logLevel }}
+      outputs:
+        - console:
+            enabled: yes
+
+    # Modo de captura: af-packet pasivo (IDS).
+    # IPS sería 'nfqueue' — no funciona bien en contenedores.
+    af-packet:
+      - interface: {{ .Values.suricata.interface }}
+        # cluster-id: identificador para PACKET_FANOUT del kernel.
+        # Permite distribuir paquetes entre múltiples threads del mismo
+        # interface. Con una sola instancia es irrelevante, pero requerido.
+        cluster-id: 99
+        cluster-type: cluster_flow
+        defrag: yes
+        use-mmap: yes        # Ring buffer en memoria compartida (eficiente)
+        tpacket-v3: yes      # API moderna del kernel (linux >= 3.10)
+
+    # Apps reconocidas por el parser. Esto activa los eventos http/dns/tls/etc.
+    # Lista mínima — se puede ampliar (smtp, ftp, smb, ...) si necesitamos.
+    app-layer:
+      protocols:
+        http:
+          enabled: yes
+        tls:
+          enabled: yes
+          detection-ports:
+            dp: 443
+        dns:
+          tcp:
+            enabled: yes
+          udp:
+            enabled: yes
+        ssh:
+          enabled: yes
+        ftp:
+          enabled: yes
+
+    # PCAP en disco DESACTIVADO. En un lab no queremos llenar /var/log con
+    # capturas — solo eventos JSON. Si en el futuro queremos forensics,
+    # se activa pcap-log.
+    pcap-log:
+      enabled: no
+
+    # Threading. 'auto' = Suricata decide según vCPUs disponibles.
+    threading:
+      set-cpu-affinity: no
+      detect-thread-ratio: 1.0
+
+  # Config del cliente suricata-update (initContainer).
+  #
+  # Por qué URL directa y NO el alias 'et/open':
+  # El alias 'et/open' requiere que `suricata-update update-sources` haya
+  # cargado el catálogo de fuentes ANTES del fetch. Ese catálogo se guarda
+  # en --data-dir, que en nuestro setup es un emptyDir nuevo en cada
+  # arranque del pod. Como el initContainer NO ejecuta `update-sources`,
+  # el alias no resuelve y se intenta interpretar como URL literal:
+  #     <Error> -- unknown url type: 'et/open'
+  # Pero el initContainer EXIT 0 igual (suricata-update trata el fetch
+  # fallido como warning) → el pod queda Ready con solo 436 rules built-in
+  # (decoder/protocol events) y CERO firmas ET Open. Detección silenciosa
+  # imposible sin mirar logs del initContainer. Lección: pinnear la URL.
+  #
+  # Versión 8.0.0 = bucket compatible con la image.tag actual (Suricata 8.0.4).
+  # Si subimos image.tag a Suricata 9.x → cambiar a suricata-9.0.0.
+  update.yaml: |
+    sources:
+      - https://rules.emergingthreats.net/open/suricata-8.0.0/emerging.rules.tar.gz

@@ -1,0 +1,11 @@
+# Vagrant local state (machine IDs, box metadata, SSH keys)
+.vagrant/
+
+# Generated qcow2 data disks (regenerables via scripts/create-disks.sh)
+disks/
+
+# Local editor/tool settings (no portables)
+.claude/
+
+# Backup antiguo del Vagrantfile
+Vagrantfile.bak

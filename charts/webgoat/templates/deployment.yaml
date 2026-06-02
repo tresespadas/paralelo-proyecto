@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "webgoat.fullname" . }}
+  labels:
+    {{- include "webgoat.labels" . | nindent 4 }}
+spec:
+  # 1 replica fija. WebGoat persiste estado de retos en H2 embedded
+  # — multiplicar replicas crearía sesiones inconsistentes (cada pod
+  # con su propia BD H2). Si en el futuro necesitamos paralelizar
+  # tests automatizados, hay que migrar a una BD externa.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "webgoat.selectorLabels" . | nindent 6 }}
+  # Recreate: el chart no usa PVC pero mantenemos el patrón consistente
+  # con charts/dvwa por si en el futuro habilitamos persistence.
+  # En servicios "stateful en disco local", Recreate evita race conditions
+  # entre el pod nuevo y el viejo durante un upgrade.
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "webgoat.selectorLabels" . | nindent 8 }}
+    spec:
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: webgoat
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: webgoat
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            - name: webwolf
+              containerPort: {{ .Values.service.webwolfPort }}
+              protocol: TCP
+          # Variables que el JAR lee de su environment.
+          # Sin WEBGOAT_HOST=0.0.0.0 → el server bindea solo a 127.0.0.1
+          # y el NodePort responde con "Connection refused" porque el
+          # tráfico que entra al container no llega al socket.
+          env:
+            - name: WEBGOAT_HOST
+              value: {{ .Values.webgoat.host | quote }}
+            - name: WEBGOAT_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: WEBWOLF_HOST
+              value: {{ .Values.webgoat.webwolfHost | quote }}
+            - name: WEBWOLF_PORT
+              value: {{ .Values.service.webwolfPort | quote }}
+            # JAVA_TOOL_OPTIONS lo respeta cualquier JVM moderna automáticamente.
+            # Limita heap para que el container no se acerque al limit de memoria
+            # del pod y muera con OOMKilled (exit 137).
+            - name: JAVA_TOOL_OPTIONS
+              value: {{ .Values.java.toolOptions | quote }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: webgoat
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: webgoat
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

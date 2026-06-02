@@ -1,0 +1,432 @@
+\section{Fase 4 -- \emph{Stack} de seguridad y CMS vulnerables}
+
+\subsection{Objetivo}
+
+Sobre el clúster con monitorización ya activa se despliegan dos detectores y tres aplicaciones vulnerables. Los detectores son \textbf{Falco} (HIDS basado en \texttt{eBPF}, observa \emph{syscalls} dentro de cualquier \emph{container}) y \textbf{Suricata} (NIDS basado en \texttt{af\_packet}, observa tráfico de red en \texttt{eth0} de un nodo). Las aplicaciones vulnerables son \textbf{DVWA}, \textbf{WebGoat} y \textbf{Juice Shop} --- tres CMS clásicos del catálogo OWASP que servirán como blancos de \emph{pen-testing} simulado desde una Kali externa al clúster.
+
+Toda la fase se automatiza desde \texttt{scripts/setup-security.sh}, que comparte el patrón de \texttt{setup-lab.sh}: \emph{re-exec} como \texttt{master}, \texttt{helm upgrade -{}-install -{}-wait}, idempotencia por diseño.
+
+\subsection{Arquitectura}
+
+\begin{center}
+\begin{tabular}{|l|l|l|l|}
+\hline
+\textbf{Componente} & \textbf{Despliegue} & \textbf{Nodo} & \textbf{Acceso} \\
+\hline
+Falco       & \texttt{DaemonSet} (sin master)         & worker1, worker2 & --- \\
+Suricata    & \texttt{DaemonSet} (\texttt{nodeSelector}) & worker1       & \texttt{hostNetwork} eth0 \\
+DVWA        & \texttt{Deployment} 1 \emph{replica}    & worker1          & NodePort 30430 \\
+WebGoat     & \texttt{Deployment} 1 \emph{replica}    & worker1          & NodePort 30380 \\
+Juice Shop  & \texttt{Deployment} 1 \emph{replica}    & worker1          & NodePort 31592 \\
+\hline
+\end{tabular}
+\end{center}
+
+Pipeline de eventos:
+\begin{itemize}
+  \item \textbf{Falco}: \texttt{stdout} JSON $\to$ Promtail (ya desplegado) $\to$ Loki $\to$ Grafana.
+  \item \textbf{Suricata}: \texttt{eve.json} (archivo) $\to$ \emph{sidecar} \texttt{tail -F} $\to$ \texttt{stdout} $\to$ Promtail $\to$ Loki $\to$ Grafana.
+  \item \textbf{Tráfico atacante}: Kali (10.0.1.20, externa al cluster CIDR) $\to$ \texttt{eth0} worker1 $\to$ visto por Suricata (\texttt{hostNetwork}) y por los \emph{logs} de Apache/Spring/Node de cada CMS.
+\end{itemize}
+
+\subsection{Concentración en worker1}
+
+Los tres CMS y Suricata corren en el mismo nodo. Razón técnica: Suricata captura tráfico con \texttt{hostNetwork: true} desde \texttt{eth0} del nodo donde corre. Si DVWA migrara a otro nodo (por re-scheduling tras una caída), Suricata dejaría de ver el tráfico atacante. Concentrar todo en worker1 es la garantía simple de que las firmas siempre disparen.
+
+Trade-off: worker1 (3072\,MiB de RAM) opera al 80--90\% de uso con todo el \emph{stack} activo. Los \texttt{resources.limits} de cada componente están ajustados para minimizar \emph{OOMKill} bajo carga:
+
+\begin{itemize}
+  \item Falco: 512\,Mi limit (default 1\,Gi).
+  \item Suricata: 1\,Gi limit (default 256\,Mi --- insuficiente con ET Open completo cargado).
+  \item DVWA: 256\,Mi limit (MySQL embebido es el componente más pesado).
+  \item WebGoat: 512\,Mi limit (Spring Boot + heap acotado por \texttt{-Xmx384m}).
+  \item Juice Shop: 192\,Mi limit (Node + Express + sqlite efímera, austero).
+\end{itemize}
+
+\subsection{Falco}
+
+Falco se instala con el \emph{chart} oficial \texttt{falcosecurity/falco} (8.0.2, app 0.43.1).
+
+\subsubsection{Driver \texttt{modern\_ebpf}}
+
+\begin{lstlisting}[style=yaml]
+driver:
+  kind: modern_ebpf
+\end{lstlisting}
+
+\texttt{modern\_ebpf} usa \texttt{BPF\_PROG\_TYPE\_RAW\_TRACEPOINT}, lo que requiere kernel \texttt{\textgreater= 5.8}. Ubuntu 22.04 cumple (kernel 5.15). Ventajas frente al \emph{kernel module} tradicional o al \emph{eBPF legacy probe}:
+
+\begin{itemize}
+  \item Sin \texttt{kernel-headers} en los \emph{workers}: no hay compilación local de un módulo.
+  \item Sin dependencia de \texttt{dkms}: el \emph{upgrade} del kernel no rompe la instalación de Falco.
+  \item \emph{Self-contained}: el binario eBPF se compila \emph{ahead-of-time} y se carga vía syscall \texttt{bpf()}.
+\end{itemize}
+
+\subsubsection{Salida JSON a \texttt{stdout}}
+
+\begin{lstlisting}[style=yaml]
+falco:
+  json_output: true
+  json_include_output_property: true
+  json_include_tags_property: true
+  log_stderr: true
+  log_syslog: false
+  stdout_output:    { enabled: true }
+  file_output:      { enabled: false }
+  http_output:      { enabled: false }
+\end{lstlisting}
+
+Solo \texttt{stdout}, que kubelet escribe en \texttt{/var/log/pods/.../falco/0.log} $\to$ Promtail $\to$ Loki. \texttt{file\_output} saturaría \texttt{hostPath} sin aportar nada (los eventos ya están en Loki); \texttt{http\_output} requeriría un \emph{receiver} externo (\emph{falcosidekick}, que dejamos desactivado por la misma razón).
+
+\subsubsection{El parámetro \texttt{base\_syscalls.repair}}
+
+\begin{lstlisting}[style=yaml]
+falco:
+  base_syscalls:
+    repair: true
+\end{lstlisting}
+
+Sin esta línea, los \emph{rules built-in} que filtran por \texttt{proc.tty != 0} (como \texttt{Terminal shell in container}) \textbf{nunca disparan}, porque \texttt{proc.tty} se queda siempre en 0 --- el árbol de procesos no tiene los datos para poblarlo. Es un \emph{footgun} silencioso: el \emph{ruleset} carga, los eventos se ven en \texttt{kubectl logs}, pero las reglas \emph{built-in} críticas no disparan nunca.
+
+Con \texttt{repair: true} Falco analiza el \emph{ruleset}, infiere qué \emph{syscalls} auxiliares necesita (\texttt{clone}, \texttt{fork}, \texttt{setsid}, \texttt{procexit}, \texttt{ioctl}\dots) para poblar \texttt{proc.tty}, \texttt{proc.pname}, \texttt{proc.cmdline}, \texttt{container.id}, etc., y se suscribe automáticamente.
+
+\subsubsection{Regla custom: ``Lab --- Shell en container''}
+
+\begin{lstlisting}[style=yaml]
+customRules:
+  rules-lab.yaml: |-
+    - rule: Lab -- Shell en container
+      desc: >
+        Dispara cuando un shell (bash, sh, zsh, ...) se ejecuta dentro
+        de un container. Excluye casos legitimos donde un package manager
+        o el runtime spawnea shells como hooks de instalacion.
+      condition: >
+        spawned_process and container
+        and proc.name in (bash, sh, zsh, ksh, csh, dash, ash, fish)
+        and not proc.pname in (apt, apt-get, dpkg, dpkg-reconfigure, yum,
+                               dnf, apk, pip, npm, conda, sudo)
+      output: >
+        [LAB] Shell en container
+        (pod=%k8s.pod.name ns=%k8s.ns.name container=%container.name
+         shell=%proc.name cmdline=%proc.cmdline parent=%proc.pname tty=%proc.tty)
+      priority: WARNING
+      tags: [lab, shell]
+\end{lstlisting}
+
+\paragraph{Iteración hasta la regla final.} La versión inicial (\emph{canary} de validación E2E del \emph{probe}) era \texttt{spawned\_process and container}, sin filtros adicionales. Funcionaba como prueba de vida: cualquier \texttt{execve} dentro de cualquier \emph{container} disparaba un evento. El problema observado:
+
+\begin{itemize}
+  \item Flannel ejecuta \texttt{iptables} y \texttt{ip} continuamente.
+  \item \texttt{kube-proxy} sondea reglas y servicios cada pocos segundos.
+  \item Los \emph{hooks} de \texttt{apt}/\texttt{dpkg} durante actualizaciones automáticas lanzan \emph{shells} legítimos.
+\end{itemize}
+
+Resultado: $\sim$16 eventos por segundo en estado \emph{idle}, casi todos ruido del \emph{runtime}. En 10 minutos, $\sim$9\,656 eventos --- imposible distinguir un atacante real.
+
+\paragraph{Refinamiento.} Se filtró por \texttt{proc.name in (bash, sh, zsh, \dots)} para quedarse con \emph{shells} interactivas, y se excluyó \texttt{proc.pname in (apt, dpkg, sudo, \dots)} para descartar \emph{shells} legítimas como hijos de gestores de paquetes. La regla refinada genera 0 eventos en estado \emph{idle} y dispara puntualmente cuando un humano hace \texttt{kubectl exec -- sh}.
+
+\subsubsection{\texttt{customRules} y \texttt{rules\_files}: la trampa}
+
+\begin{lstlisting}[style=yaml]
+falco:
+  rules_files:
+    - /etc/falco/falco_rules.yaml
+    - /etc/falco/falco_rules.local.yaml
+    - /etc/falco/rules.d
+\end{lstlisting}
+
+El \emph{chart} monta \texttt{customRules} como \texttt{ConfigMap} en \texttt{/etc/falco/rules.d/}. \textbf{Crítico}: \texttt{/etc/falco/rules.d} debe estar en \texttt{rules\_files}; si se sobrescribe \texttt{rules\_files} sin incluirla, las reglas \emph{custom} se montan en el pod pero Falco \emph{nunca las carga}, sin error visible. Es la misma categoría de fallo que el \texttt{base\_syscalls.repair}: el síntoma es ``mi regla no dispara'' y la causa está enterrada en una sub-clave de configuración.
+
+\subsection{Suricata}
+
+Suricata no tiene \emph{chart} oficial estable. Se desarrolló un \emph{chart} propio en \texttt{charts/suricata/} con tres recursos: \texttt{ConfigMap} (\texttt{suricata.yaml} + \texttt{update.yaml}), \texttt{DaemonSet} (init + main + sidecar) y los \emph{helpers} de Helm.
+
+\subsubsection{\texttt{hostNetwork} y \emph{capabilities}}
+
+\begin{lstlisting}[style=yaml]
+hostNetwork: true
+dnsPolicy: ClusterFirstWithHostNet
+securityContext:
+  capabilities:
+    add: [NET_ADMIN, NET_RAW, SYS_NICE]
+\end{lstlisting}
+
+\texttt{hostNetwork: true} es el \emph{toggle} crítico: el pod comparte el \emph{network namespace} del nodo y ve \texttt{eth0} entera. Sin esto, Suricata solo ve el \emph{netns} vacío del pod y captura 0 paquetes útiles.
+
+Las \emph{capabilities} mínimas son:
+\begin{itemize}
+  \item \texttt{NET\_ADMIN}: setear modo promiscuo, configurar el \emph{ring buffer} \texttt{TPACKET\_V3}.
+  \item \texttt{NET\_RAW}: crear \emph{sockets} \texttt{AF\_PACKET} (capa 2, Ethernet completo).
+  \item \texttt{SYS\_NICE}: cambiar prioridad de \emph{threads} de captura.
+\end{itemize}
+
+Notablemente, \textbf{no se usa} \texttt{privileged: true}. El kernel Linux permite todo lo necesario con \emph{capabilities} granulares, sin dar acceso total al host.
+
+\paragraph{\texttt{dnsPolicy: ClusterFirstWithHostNet}.} Cuando \texttt{hostNetwork: true}, el pod hereda \texttt{/etc/resolv.conf} del nodo (que no apunta a CoreDNS). Si tuviéramos que resolver \emph{services} de Kubernetes desde dentro del pod, fallarían. Con \texttt{ClusterFirstWithHostNet} se fuerza el uso de CoreDNS aunque la red sea del host. En el lab Suricata no resuelve nombres K8s, pero la línea queda como higiene.
+
+\subsubsection{Captura con \texttt{af-packet}}
+
+\begin{lstlisting}[style=yaml]
+af-packet:
+  - interface: eth0
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    use-mmap: yes        # ring buffer en memoria compartida
+    tpacket-v3: yes      # API moderna del kernel
+\end{lstlisting}
+
+Modo IDS pasivo (no IPS). Para IPS habría que usar \texttt{nfqueue} y enganchar el tráfico vía \texttt{iptables -j NFQUEUE}, lo que no funciona bien en \emph{containers} y queda fuera de \emph{scope} del lab.
+
+\subsubsection{Variables de red: \texttt{HOME\_NET} y \texttt{HTTP\_PORTS}}
+
+\begin{lstlisting}[style=yaml]
+vars:
+  address-groups:
+    HOME_NET: "[10.0.1.10/32,10.0.1.11/32,10.0.1.12/32,10.233.0.0/16]"
+    EXTERNAL_NET: "!$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "80,30430,30380,31592"
+\end{lstlisting}
+
+\paragraph{Diseño del \texttt{HOME\_NET}.} Las firmas ET Open están escritas en términos de \texttt{\$EXTERNAL\_NET -> \$HOME\_NET}: solo disparan cuando origen y destino tienen ese sentido. Si la IP de la Kali atacante (10.0.1.20) cayese dentro de \texttt{HOME\_NET}, las firmas \emph{no dispararían} (sería \texttt{HOME -> HOME}). Por eso se enumeran nodos individuales (\texttt{/32}) y el CIDR de pods/services (\texttt{10.233.0.0/16}) explícitamente, dejando 10.0.1.20 fuera. Era el \emph{footgun} clásico: usar \texttt{10.0.1.0/24} ``por simplicidad'' anula la mayoría de detecciones sin error visible.
+
+\paragraph{\texttt{HTTP\_PORTS} parametrizado.} Las firmas \texttt{ET WEB\_SERVER \dots} están escritas como \texttt{flow:to\_server,established; http.uri; \dots}, lo que requiere que Suricata haya clasificado el flujo como HTTP \emph{antes} de evaluar la regla. La clasificación se hace por \texttt{\$HTTP\_PORTS}. Si un CMS expone en un puerto que no está en esa lista, Suricata lo trata como TCP genérico y las firmas web nunca disparan --- de nuevo, sin error visible.
+
+Cuando se añadieron WebGoat (30380) y Juice Shop (31592), tuvieron que añadirse a \texttt{HTTP\_PORTS} para que las firmas web disparasen contra ellos. Para no repetir el error, la lista vive como variable en \texttt{values.yaml} del \emph{chart}:
+
+\begin{lstlisting}[style=yaml]
+suricata:
+  httpPorts:
+    - 80
+    - 30430
+    - 30380
+    - 31592
+\end{lstlisting}
+
+y el \texttt{ConfigMap} la materializa con la función \texttt{join} de Sprig:
+
+\begin{lstlisting}[style=yaml]
+HTTP_PORTS: "{{ join "," .Values.suricata.httpPorts }}"
+\end{lstlisting}
+
+\subsubsection{El \emph{init container}: descarga del \emph{ruleset} ET Open}
+
+\begin{lstlisting}[style=yaml]
+initContainers:
+  - name: rules-update
+    image: jasonish/suricata:latest
+    command: ["suricata-update"]
+    args:
+      - "--no-test"
+      - "--output=/var/lib/suricata/rules"
+      - "--data-dir=/var/lib/suricata"
+      - "--config=/etc/suricata/update.yaml"
+\end{lstlisting}
+
+\texttt{suricata-update} viene en la imagen oficial. El \emph{ruleset} se descarga a un \texttt{emptyDir} compartido con el \emph{container} principal (no se persiste --- se re-descarga en cada \emph{start} del pod, $\sim$30\,s).
+
+\paragraph{URL directa frente al alias \texttt{et/open}.}
+
+\begin{lstlisting}[style=yaml]
+update.yaml: |
+  sources:
+    - https://rules.emergingthreats.net/open/suricata-8.0.0/emerging.rules.tar.gz
+\end{lstlisting}
+
+El alias \texttt{et/open} requiere que \texttt{suricata-update update-sources} haya cargado el catálogo de fuentes \emph{antes} del \emph{fetch}. Ese catálogo se guarda en \texttt{-{}-data-dir}, que en nuestro setup es un \texttt{emptyDir} nuevo cada arranque. Como el \emph{init container} no ejecuta \texttt{update-sources}, el alias no resuelve --- se intenta interpretar como URL literal y falla con \texttt{unknown url type: 'et/open'}. Pero el \emph{init container} sale con \texttt{exit 0} (\emph{warning}, no error), así que el pod queda \texttt{Ready} con solo 436 reglas \emph{decoder/protocol} y \textbf{cero firmas ET Open}. Detección silenciosamente rota. Fijar la URL directa elimina el problema.
+
+\subsubsection{El \emph{sidecar} \texttt{tail -F eve.json}}
+
+\begin{lstlisting}[style=yaml]
+- name: log-tail
+  image: jasonish/suricata:latest
+  command: ["sh", "-c"]
+  args:
+    - |
+      until [ -f /var/log/suricata/eve.json ]; do sleep 1; done
+      exec tail -F /var/log/suricata/eve.json
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities: { drop: [ALL] }
+\end{lstlisting}
+
+Promtail solo lee \texttt{stdout} de los pods; Suricata escribe \texttt{eve.json} a archivo. El \emph{sidecar} es el puente: \texttt{tail -F} (mayúscula) re-abre el archivo si Suricata lo rota (algo que \texttt{tail -f} minúscula \emph{no} hace, se queda leyendo el \emph{inode} antiguo eternamente).
+
+\paragraph{Reuso de la imagen principal.} El \emph{sidecar} usa \texttt{jasonish/suricata} en vez de \texttt{busybox}. Razones: (1) \texttt{tail} GNU está en la imagen, (2) un solo \emph{pull} y un solo conjunto de \emph{layers} cacheados, (3) algunos \emph{blobs} de \texttt{busybox} en Docker Hub se sirven desde Cloudflare R2 con IPs ocasionalmente no enrutables en la red \texttt{red-prueba}. Trade-off: el \emph{sidecar} arranca con 139\,MB de imagen en vez de 5\,MB, pero no añade RAM real (\emph{layers} compartidos).
+
+\paragraph{Defensa en profundidad.} El \emph{sidecar} solo lee --- no necesita \emph{capabilities} ni acceso de escritura. \texttt{drop: [ALL]} elimina cualquier privilegio remanente. Un compromiso del \emph{sidecar} no puede manipular \emph{logs} ni capturar tráfico.
+
+\subsubsection{Coherencia config: \texttt{stats}}
+
+\begin{lstlisting}[style=yaml]
+outputs:
+  - eve-log:
+      enabled: yes
+      types:
+        - alert
+        - http
+        - dns
+        - tls
+        - flow
+        # NO incluir 'stats' aqui si outputs.stats.enabled = no
+  - stats:
+      enabled: no
+\end{lstlisting}
+
+Una particularidad de Suricata: si \texttt{outputs.stats.enabled: no} globalmente, no se puede incluir \texttt{stats} dentro de \texttt{eve-log.types}. Suricata aborta el arranque con \emph{``stats are disabled globally''}. La coherencia entre el \emph{sub-output} y el \emph{output} principal es obligatoria.
+
+\subsection{DVWA --- \emph{Damn Vulnerable Web Application}}
+
+DVWA se despliega vía \emph{chart} propio en \texttt{charts/dvwa/}.
+
+\subsubsection{Imagen \texttt{vulnerables/web-dvwa}}
+
+\begin{lstlisting}[style=yaml]
+image:
+  repository: vulnerables/web-dvwa
+  tag: latest
+\end{lstlisting}
+
+Se eligió la imagen \texttt{vulnerables/web-dvwa} (todo-en-uno: Apache + PHP + MySQL embebido) en lugar de \texttt{ghcr.io/digininja/dvwa} (la oficial, que requiere MariaDB como segundo \texttt{Deployment}). Razón: un solo \emph{container}, menos partes móviles, BD inicializada \emph{out of the box}.
+
+\subsubsection{Sin persistencia (decisión consciente)}
+
+\begin{lstlisting}[style=yaml]
+persistence:
+  enabled: false
+\end{lstlisting}
+
+La imagen \texttt{vulnerables/web-dvwa} trae la base de datos MariaDB \textbf{horneada en la imagen} (en \texttt{/var/lib/mysql}). Su \emph{entrypoint} (\texttt{/main.sh}) solo hace \texttt{service mysql start}, no ejecuta \texttt{mysql\_install\_db}. Si montamos un PVC encima de \texttt{/var/lib/mysql}, el \emph{mount} ``ensombrece'' la BD pre-cocinada $\to$ \emph{datadir} vacío $\to$ \texttt{mysqld} arranca pero falla con \emph{``Table 'mysql.user' doesn't exist''}.
+
+Alternativas descartadas: pre-popular el PV con un \emph{init container} que copie la BD baked, o ejecutar \texttt{mysql\_install\_db} manualmente. Ambas añaden complejidad sin beneficio práctico --- en un lab de detección de ataques, perder progreso entre \emph{restarts} es aceptable.
+
+\subsubsection{Probe \texttt{/login.php}}
+
+\begin{lstlisting}[style=yaml]
+probes:
+  liveness:
+    path: /login.php
+    initialDelaySeconds: 30
+    periodSeconds: 30
+\end{lstlisting}
+
+El \emph{probe} apunta a \texttt{/login.php}, no a \texttt{/}. Razón: \texttt{/} devuelve 302 redirigiendo a \texttt{/setup.php} hasta que la BD se inicializa. \texttt{/login.php} devuelve 200 directamente con la BD horneada operativa al arranque.
+
+\subsubsection{\texttt{strategy: Recreate}}
+
+\begin{lstlisting}[style=yaml]
+strategy:
+  type: Recreate
+\end{lstlisting}
+
+Aunque no hay PVC, se mantiene el patrón por consistencia con cualquier futuro \emph{enable} de \texttt{persistence}. Con \texttt{Recreate}, el pod viejo se mata antes de arrancar el nuevo --- no hay dos \texttt{mysqld} escribiendo a la misma BD simultáneamente.
+
+\subsection{WebGoat}
+
+\subsubsection{Imagen oficial}
+
+\begin{lstlisting}[style=yaml]
+image:
+  repository: webgoat/webgoat
+  tag: latest
+\end{lstlisting}
+
+\texttt{webgoat/webgoat} es la imagen oficial OWASP. Lleva WebGoat (puerto 8080) y WebWolf (puerto 9090) en un único \emph{container}, lanzados por el \emph{entrypoint} del JAR.
+
+\subsubsection{Variables de entorno críticas}
+
+\begin{lstlisting}[style=yaml]
+env:
+  - { name: WEBGOAT_HOST, value: "0.0.0.0" }
+  - { name: WEBGOAT_PORT, value: "8080" }
+  - { name: WEBWOLF_HOST, value: "0.0.0.0" }
+  - { name: WEBWOLF_PORT, value: "9090" }
+  - { name: JAVA_TOOL_OPTIONS, value: "-Xmx384m -Xms256m" }
+\end{lstlisting}
+
+\paragraph{\texttt{WEBGOAT\_HOST=0.0.0.0}.} Sin esto, el JAR bindea solo a \texttt{127.0.0.1} y el \texttt{NodePort} responde con \emph{``Connection refused''}: el tráfico llega al \emph{container} pero no a ningún socket abierto. Es un \emph{default} desafortunado de la imagen oficial.
+
+\paragraph{\texttt{JAVA\_TOOL\_OPTIONS} para acotar el \emph{heap}.} Sin acotar, Spring Boot crece hasta donde le deja el host --- en worker1, eso significa rebasar el limit de 512\,Mi del \emph{container} y morir \texttt{OOMKilled} (\emph{exit 137}) tras pocos minutos. Acotar \texttt{-Xmx384m} reserva $\sim$128\,Mi para \emph{metaspace}, \emph{thread stacks} y código JIT. Cualquier JVM moderna lee \texttt{JAVA\_TOOL\_OPTIONS} del entorno automáticamente.
+
+\subsubsection{URL \emph{case-sensitive}: \texttt{/WebGoat}}
+
+WebGoat usa \texttt{/WebGoat} con \texttt{W} y \texttt{G} mayúsculas en sus redirecciones internas. \texttt{/webgoat} devuelve 404. El \emph{probe} canónico:
+
+\begin{lstlisting}[style=yaml]
+probes:
+  liveness:
+    path: /WebGoat/login.mvc
+    initialDelaySeconds: 120
+\end{lstlisting}
+
+\texttt{initialDelaySeconds: 120} cubre el \emph{cold start} de Spring Boot (\emph{classpath scanning} + inicialización de H2 embedded), que puede llegar a 90\,s en worker1 cargado.
+
+\subsection{Juice Shop}
+
+\subsubsection{Despliegue mínimo}
+
+\begin{lstlisting}[style=yaml]
+image:
+  repository: bkimminich/juice-shop
+  tag: latest
+service:
+  type: NodePort
+  port: 3000
+  nodePort: 31592
+persistence:
+  enabled: false
+\end{lstlisting}
+
+Juice Shop es el más austero del trío: Node + Express + sqlite efímera. No requiere variables de entorno específicas; la imagen oficial corre en modo \emph{production} por defecto y los retos están todos accesibles desde \texttt{/\#/score-board}.
+
+\subsubsection{Sin login inicial}
+
+A diferencia de DVWA (\texttt{admin/password}) y WebGoat (registro de cuenta nueva en cada arranque), Juice Shop expone toda la \emph{landing page} sin autenticación. Los retos OWASP Top 10 están integrados como minijuegos progresivos.
+
+\subsection{El \emph{script} \texttt{setup-security.sh}}
+
+Estructura en 9 fases:
+
+\begin{enumerate}
+  \item \textbf{Precondición}: verifica que \texttt{monitoring/promtail} esté \texttt{Ready}. Sin Promtail, los eventos generados por Falco y Suricata se perderían --- mejor abortar pronto que dejar detectores ``huérfanos''.
+  \item \textbf{Repo Helm de Falco}: solo Falco viene de un repo \emph{upstream}; Suricata, DVWA, WebGoat y Juice Shop son \emph{charts} locales bajo \texttt{charts/}.
+  \item \textbf{Namespaces}: \texttt{security} + \texttt{vulnerable} con el patrón idempotente \texttt{create -{}-dry-run=client -o yaml | apply -f -}.
+  \item \textbf{Falco}.
+  \item \textbf{Suricata}: \texttt{helm install /vagrant/charts/suricata}.
+  \item \textbf{DVWA}: \texttt{helm install /vagrant/charts/dvwa}.
+  \item \textbf{WebGoat}: \texttt{-{}-timeout 8m} para cubrir el \emph{cold start} de Spring Boot.
+  \item \textbf{Juice Shop}.
+  \item \textbf{Resumen}: imprime endpoints y queries LogQL canónicas.
+\end{enumerate}
+
+Invocación:
+
+\begin{lstlisting}[style=bash]
+vagrant provision test-master --provision-with setup-security
+\end{lstlisting}
+
+\subsection{Lecciones transversales}
+
+\subsubsection{Charts custom: límite a Helm \emph{upstream}}
+
+Cuando no hay \emph{chart} estable y bien mantenido (Suricata) o cuando el oficial impone más complejidad que beneficio (DVWA con la oficial \texttt{digininja/dvwa} + MariaDB aparte), escribir un \emph{chart} propio simplificado de 3--4 plantillas es \emph{más} robusto que parchear un \emph{chart} \emph{upstream} con \texttt{values}. El coste de mantenimiento es contenido: los \emph{templates} son lineales y los \texttt{values} viven con el código que documentan.
+
+\subsubsection{Imágenes con \emph{defaults} hostiles a \texttt{NodePort}}
+
+WebGoat es el ejemplo claro: una imagen ``oficial'' que bindea a \texttt{127.0.0.1} por defecto es prácticamente inservible en Kubernetes sin un \texttt{env} explícito de \texttt{0.0.0.0}. La lección: nunca asumir que una imagen oficial está optimizada para el caso \emph{containerizado} --- probar el \emph{flow} \texttt{NodePort $\to$ pod} pronto y observar logs.
+
+\subsubsection{Detectores silenciosamente rotos}
+
+Tres ejemplos en este capítulo:
+\begin{itemize}
+  \item Falco sin \texttt{base\_syscalls.repair} $\to$ \emph{rules built-in} con \texttt{proc.tty} nunca disparan.
+  \item Suricata con alias \texttt{et/open} en \texttt{update.yaml} $\to$ \emph{ruleset} ET Open no se descarga, queda con 436 \emph{decoder rules}.
+  \item Suricata sin \texttt{HTTP\_PORTS} actualizado $\to$ firmas \texttt{ET WEB\_SERVER} no clasifican el flujo como HTTP y no disparan.
+\end{itemize}
+
+Los tres son síntomas de la misma categoría: ``el sistema funciona aparentemente, los pods están \texttt{Ready}, los \emph{logs} no muestran errores, pero los detectores están sordos''. La defensa es el test \emph{end-to-end}: lanzar un ataque conocido (un \texttt{curl} con \texttt{?id=1' OR '1'='1}, un \texttt{kubectl exec -- sh}) y verificar que aparece el evento esperado en Loki/Grafana \emph{antes} de dar el \emph{stack} por terminado.
+
+\subsection{Estado tras Fase 4}
+
+Con las cuatro fases completas, un \texttt{vagrant up} seguido de tres \texttt{vagrant provision -{}-provision-with} deja un laboratorio Kubernetes funcional, observable y con superficie de ataque definida, listo para \emph{pen-test} simulado desde Kali. Los siguientes hitos no cubiertos en este documento (y reservados para iteraciones posteriores) incluyen el cableado de Alertmanager y un \emph{bot} de Telegram para alertas \emph{push}.

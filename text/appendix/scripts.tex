@@ -1,0 +1,63 @@
+\section{Scripts}
+
+A continuación se listan todos los \emph{scripts} del proyecto. Cada uno está incluido vía \texttt{\textbackslash inputscript}, que lo lee directamente desde \texttt{../scripts/} al compilar el LaTeX. Esto significa que el contenido del PDF refleja el estado real del repositorio en el momento de la compilación --- no hay copias estáticas que puedan desfasarse.
+
+\subsection{\texttt{network-check.sh}}
+
+\emph{Trigger} de host (\texttt{before :up}, \texttt{only\_on: test-master}). Compara la configuración activa de \texttt{red-prueba} en libvirt con el XML del repositorio y la recrea si difieren.
+
+\inputscript{network-check.sh}
+
+\subsection{\texttt{create-disks.sh}}
+
+\emph{Trigger} de host (\texttt{before :up}, \texttt{only\_on: test-master}). Crea los discos qcow2 \emph{sparse} en \texttt{disks/} y configura las ACL para el usuario \texttt{libvirt-qemu}.
+
+\inputscript{create-disks.sh}
+
+\subsection{\texttt{config.sh}}
+
+\emph{Provisioner} \emph{shell} que se ejecuta en las tres VMs en cada \texttt{up}. Instala paquetes base (\texttt{vim}, \texttt{python3}, \texttt{python3-pip}, \texttt{python3-venv}, \texttt{git}).
+
+\inputscript{config.sh}
+
+\subsection{\texttt{ssh-setup.sh}}
+
+\emph{Provisioner} \emph{shell} que se ejecuta en las tres VMs. Crea el usuario personalizado, copia la clave pública de Vagrant a \texttt{authorized\_keys} e instala la clave compartida del lab para SSH entre nodos.
+
+\inputscript{ssh-setup.sh}
+
+\subsection{\texttt{ssh-config.sh}}
+
+\emph{Trigger} de host (\texttt{after :up}, \texttt{only\_on: test-worker2}). Escribe entradas SSH en \texttt{\textasciitilde/.ssh/config} del \emph{host} con los usuarios personalizados, envueltas entre marcadores para idempotencia.
+
+\inputscript{ssh-config.sh}
+
+\subsection{\texttt{attach-disks.sh}}
+
+\emph{Trigger} de host (\texttt{after :up}, \texttt{only\_on: test-worker2}). Conecta los qcow2 como \texttt{vdb} con \texttt{virsh attach-disk -{}-persistent}, formatea ext4 si está vacío, monta en \texttt{/mnt/data} y persiste vía \texttt{/etc/fstab}.
+
+\inputscript{attach-disks.sh}
+
+\subsection{\texttt{setup-kubespray.sh}}
+
+\emph{Provisioner} \texttt{run: "never"} en \texttt{test-master}. Despliega Kubernetes v1.30.4 con Kubespray v2.26.0 (Flannel CNI, \texttt{containerd}) y crea los tres \emph{namespaces}.
+
+\textbf{Invocación}: \texttt{vagrant provision test-master -{}-provision-with setup-kubespray}
+
+\inputscript{setup-kubespray.sh}
+
+\subsection{\texttt{setup-lab.sh}}
+
+\emph{Provisioner} \texttt{run: "never"} en \texttt{test-master}. Despliega el \emph{stack} de monitorización (Helm 4 si falta, repos, \texttt{chown} de \texttt{hostPath}s, PV/PVC, Grafana, Prometheus, Loki, Promtail).
+
+\textbf{Invocación}: \texttt{vagrant provision test-master -{}-provision-with setup-lab}
+
+\inputscript{setup-lab.sh}
+
+\subsection{\texttt{setup-security.sh}}
+
+\emph{Provisioner} \texttt{run: "never"} en \texttt{test-master}. Despliega Falco, Suricata y los tres CMS vulnerables (DVWA, WebGoat, Juice Shop).
+
+\textbf{Invocación}: \texttt{vagrant provision test-master -{}-provision-with setup-security}
+
+\inputscript{setup-security.sh}

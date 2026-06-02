@@ -1,0 +1,79 @@
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish, provide=*]{babel}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{listingsutf8}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\geometry{a4paper, margin=1in}
+\renewcommand{\contentsname}{Fases del proyecto}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue,
+  citecolor=black,
+}
+
+\definecolor{codebg}{RGB}{245,245,245}
+\definecolor{codecomment}{RGB}{106,153,85}
+\definecolor{codekeyword}{RGB}{0,0,180}
+\definecolor{codestring}{RGB}{163,21,21}
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{codecomment},
+  keywordstyle=\color{codekeyword}\bfseries,
+  stringstyle=\color{codestring},
+  breaklines=true,
+  frame=single,
+  tabsize=2,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  extendedchars=true,
+  inputencoding=utf8,
+  literate=
+    {á}{{\'a}}1 {é}{{\'e}}1 {í}{{\'i}}1 {ó}{{\'o}}1 {ú}{{\'u}}1
+    {Á}{{\'A}}1 {É}{{\'E}}1 {Í}{{\'I}}1 {Ó}{{\'O}}1 {Ú}{{\'U}}1
+    {ñ}{{\~n}}1 {Ñ}{{\~N}}1 {ü}{{\"u}}1 {Ü}{{\"U}}1
+    {¿}{{?`}}1 {¡}{{!`}}1
+    {—}{{---}}1 {–}{{--}}1
+    {→}{{$\rightarrow$}}1 {←}{{$\leftarrow$}}1
+    {↑}{{$\uparrow$}}1   {↓}{{$\downarrow$}}1
+    {⇒}{{$\Rightarrow$}}1 {≥}{{$\geq$}}1 {≤}{{$\leq$}}1
+    {≠}{{$\neq$}}1 {±}{{$\pm$}}1 {×}{{$\times$}}1 {÷}{{$\div$}}1
+    {°}{{$^{\circ}$}}1 {…}{{\ldots}}1 {·}{{$\cdot$}}1
+    {“}{{``}}1 {”}{{''}}1 {‘}{{`}}1 {’}{{'}}1,
+}
+
+\lstdefinestyle{bash}{language=bash}
+\lstdefinestyle{xml}{language=xml}
+\lstdefinestyle{yaml}{
+  basicstyle=\ttfamily\footnotesize,
+  morekeywords={apiVersion, kind, metadata, spec, name, namespace, labels,
+                replicas, selector, template, containers, image, ports,
+                resources, requests, limits, env, value, volumeMounts, volumes,
+                nodeSelector, tolerations, securityContext, capabilities,
+                hostNetwork, dnsPolicy, command, args, type, port, nodePort,
+                claimName, persistentVolumeClaim, configMap, emptyDir,
+                hostPath, accessModes, capacity, storageClassName, mountPath,
+                subPath, readOnly},
+  keywordstyle=\color{codekeyword}\bfseries,
+}
+
+\newcommand{\inputscript}[1]{%
+  \lstinputlisting[style=bash, inputencoding=utf8]{../scripts/#1}}
+\newcommand{\inputvalues}[1]{%
+  \lstinputlisting[style=yaml, inputencoding=utf8]{../values/#1}}
+\newcommand{\inputmanifest}[1]{%
+  \lstinputlisting[style=yaml, inputencoding=utf8]{../manifests/#1}}
+
+\title{Laboratorio de Kubernetes con Monitorización y Seguridad \\
+       \large Proyecto integrador}
+\author{Álvaro Cabello Aguilar}
+\date{Curso 2025/2026}

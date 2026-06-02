@@ -1,0 +1,201 @@
+# values/falco.yaml — Falco standalone, runtime IDS via eBPF moderno
+#
+# Chart: falcosecurity/falco 8.0.2  (App: 0.43.1)
+# Modo:  DaemonSet en worker1 + worker2 (master excluido por tolerations vacías)
+# Output: stdout JSON → Promtail (ya desplegado) → Loki → Grafana
+#
+# Decisión arquitectónica clave:
+#   No desplegamos falcosidekick (router HTTP de eventos). Promtail ya
+#   recoge el stdout del pod de Falco y lo manda a Loki. Añadir sidekick
+#   sería un tercer salto innecesario en la pipeline para nuestro lab.
+
+# Driver del kernel: cómo Falco intercepta syscalls.
+# 'modern_ebpf' usa BPF_PROG_TYPE_RAW_TRACEPOINT — requiere kernel >= 5.8.
+# Ubuntu 22.04 trae kernel 5.15 → cumple. Sin kernel-headers, sin compilación.
+# Alternativas (kernel module, eBPF probe legacy) requieren paquetes extra
+# y pueden romper en upgrades del kernel — modern_ebpf es self-contained.
+driver:
+  kind: modern_ebpf
+
+# tolerations vacías → DaemonSet NO schedulea en master (tiene taint
+# 'node-role.kubernetes.io/control-plane:NoSchedule'). Coherente con
+# Promtail, node-exporter y kube-state-metrics — el monitoring/security
+# stack de este lab no toca master.
+tolerations: []
+
+# Recursos contenidos. Lección directa del vault de ~/Work/proyecto/:
+#   "worker1 con 2048 MB queda al 91% de memoria con vulnerables + IDS.
+#    Solución: bajar requests de Falco a 50m/128Mi sin afectar funcionalidad."
+# Los limits altos permiten picos cuando el ruleset evalúa una tormenta
+# de syscalls; los requests bajos son la reserva fija que el scheduler
+# considera para placement.
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+# falcosidekick = router HTTP de eventos (Slack, Loki, Elasticsearch, etc).
+# Desactivado: Promtail ya cubre la ruta a Loki vía stdout, no añadimos
+# un componente intermedio. Si en el futuro queremos enviar a Slack/email,
+# sidekick es el camino — pero entonces sí merece su propio chart aparte.
+falcosidekick:
+  enabled: false
+
+# Reglas custom del lab. El chart genera un ConfigMap con estos archivos y
+# los añade automáticamente a rules_files. Cada clave del map es el nombre
+# del archivo virtual; el contenido es YAML de Falco.
+#
+# 'Lab — Shell en container' es una regla de detección, no de control.
+# La versión original (`spawned_process and container`) servía como
+# canary E2E del probe, pero generaba ~16 eventos/segundo en operación
+# normal: cualquier `iptables` que lanza flannel, cualquier `ip` que
+# lanza kube-proxy, cualquier hook de `apt` durante updates, etc.
+# Esa rule disparaba contra TODO execve sin distinguir humano de runtime.
+#
+# La rule actual ya solo dispara con shells humanas (bash/sh/zsh/...) y
+# excluye los casos legítimos donde un shell aparece como hijo de un
+# package manager o supervisor de container. Complementa la rule
+# built-in `Terminal shell in container` — esa requiere tty != 0;
+# esta dispara aunque alguien lance `bash -c "..."` sin tty (más sigiloso).
+customRules:
+  rules-lab.yaml: |-
+    - rule: Lab — Shell en container
+      desc: >
+        Dispara cuando un shell (bash, sh, zsh, ...) se ejecuta dentro
+        de un container. Excluye casos legítimos donde un package manager
+        o el runtime spawnea shells como hooks de instalación.
+      condition: >
+        spawned_process and container
+        and proc.name in (bash, sh, zsh, ksh, csh, dash, ash, fish)
+        and not proc.pname in (apt, apt-get, dpkg, dpkg-reconfigure, yum,
+                               dnf, apk, pip, npm, conda, sudo)
+      output: >
+        [LAB] Shell en container
+        (pod=%k8s.pod.name ns=%k8s.ns.name container=%container.name
+         shell=%proc.name cmdline=%proc.cmdline parent=%proc.pname tty=%proc.tty)
+      priority: WARNING
+      tags: [lab, shell]
+
+  # Extensión de la lista 'sensitive_file_names' del ruleset oficial.
+  #
+  # El default cubre /etc/shadow, /etc/sudoers, /etc/pam.conf y
+  # /etc/security/pwquality.conf. Añadimos el token de service account de
+  # Kubernetes, que es el objetivo principal de exfiltración en breaches
+  # modernos de containers. La regla built-in 'Read sensitive file untrusted'
+  # automáticamente extiende su cobertura sin tocarse — solo modificamos la
+  # lista que consulta.
+  #
+  # Override de list funciona igual que override de macro: misma 'name', el
+  # último cargado gana. Nuestro archivo se monta en /etc/falco/rules.d/ que
+  # se carga después de /etc/falco/falco_rules.yaml.
+  rules-sa-token-sensitive.yaml: |-
+    - list: sensitive_file_names
+      items:
+        - /etc/shadow
+        - /etc/sudoers
+        - /etc/pam.conf
+        - /etc/security/pwquality.conf
+        - /var/run/secrets/kubernetes.io/serviceaccount/token
+        - /run/secrets/kubernetes.io/serviceaccount/token
+
+  # NOTA HISTÓRICA — intento descartado de activar la regla built-in
+  # 'Contact K8S API Server From Container' para detectar exfiltración del
+  # token de service account.
+  #
+  # La macro built-in 'k8s_api_server' usa fd.sip.name= con el FQDN del API
+  # server (kubernetes.default.svc.cluster.local), lo que requiere el plugin
+  # k8smeta para poblar ese campo. Sin plugin, la regla nunca dispara.
+  #
+  # Override probado con IP+puerto directo (fd.sip="10.233.0.1" and
+  # fd.sport=443): tampoco funciona. Razón: kube-proxy hace iptables/IPVS
+  # DNAT a la ClusterIP antes de que modern_ebpf complete el connect()
+  # syscall. Resultado: el syscall queda con typechar=u y sip=<NA>, sin
+  # información de IP destino disponible para la condition.
+  #
+  # Verificado experimentalmente:
+  #   - connect a 8.8.8.8:53     → Falco lo ve con sip=8.8.8.8 completo
+  #   - connect a 127.0.0.1:3306 → Falco lo ve con sip=127.0.0.1 completo
+  #   - connect a 10.233.0.1:443 → Falco solo ve typechar=u sip=<NA>
+  #
+  # Es una limitación arquitectónica conocida del proyecto Falco con
+  # CNI/kube-proxy. La solución oficial para detección de uso del API
+  # server es el plugin k8saudit (consume audit logs del kube-apiserver,
+  # no eBPF). Queda fuera del scope de este lab.
+  #
+  # Decisión consciente: la detección de exfiltración del token de service
+  # account se cubre con la regla built-in 'Read sensitive file untrusted',
+  # que dispara al hacer cat /var/run/secrets/kubernetes.io/serviceaccount/
+  # token. Nadie lee ese archivo legítimamente desde un container de
+  # aplicación; la lectura es la prueba del ataque, no el uso posterior
+  # del token contra la API.
+
+# Configuración del archivo /etc/falco/falco.yaml dentro del pod.
+# El chart toma esta sub-sección, la serializa a YAML, y la monta como
+# ConfigMap en el pod. Ojo: las claves aquí dentro NO siguen las
+# convenciones de values.yaml (camelCase) — siguen las de Falco
+# (snake_case), porque es literalmente un archivo de Falco.
+falco:
+  # Output JSON estructurado por línea, no texto plano.
+  # Beneficio en LogQL: podemos filtrar por { app="falco" } | json
+  # y luego hacer queries sobre rule, priority, output_fields, etc.
+  json_output: true
+  json_include_output_property: true
+  json_include_tags_property: true
+
+  # log_stderr controla logs DEL PROCESO Falco (errores de carga del driver,
+  # warnings de reglas, etc.) — distinto de los eventos detectados.
+  # Mantener en stderr para que 'kubectl logs' los muestre cuando algo va mal.
+  log_stderr: true
+  log_syslog: false
+
+  # Salidas habilitadas. Solo stdout (que kubelet escribe en
+  # /var/log/pods/.../falco/0.log → Promtail lo recoge automáticamente).
+  # Resto desactivado: file_output saturaría hostPath; http_output
+  # requiere endpoint externo; syslog requiere journald del nodo.
+  stdout_output:
+    enabled: true
+  syslog_output:
+    enabled: false
+  file_output:
+    enabled: false
+  http_output:
+    enabled: false
+
+  # Reglas cargadas. Tres entradas:
+  #   - falco_rules.yaml      → ruleset oficial (descargado por falcoctl,
+  #                              ~25 reglas con maturity 'stable')
+  #   - falco_rules.local.yaml → overrides locales (vacío por defecto)
+  #   - /etc/falco/rules.d     → drop-in directory: Falco escanea cada
+  #                              *.yaml dentro y los carga. CRÍTICO: aquí
+  #                              es donde el chart monta los archivos
+  #                              definidos en 'customRules' de este values.
+  #                              Sin esta entrada, las reglas custom NO se
+  #                              cargan aunque estén físicamente en el pod.
+  #
+  # Lección aprendida: el default del chart incluye estas tres entradas.
+  # Si overrideas rules_files, hay que mantenerlas todas — borrar una
+  # silenciosamente desactiva un mecanismo (en este caso, el customRules).
+  rules_files:
+    - /etc/falco/falco_rules.yaml
+    - /etc/falco/falco_rules.local.yaml
+    - /etc/falco/rules.d
+
+  # base_syscalls controla qué syscalls captura el probe eBPF.
+  #
+  # repair=true → Falco analiza las reglas, infiere qué campos derivados
+  # necesitan (proc.tty, proc.pname, proc.cmdline, container.id, etc.) y
+  # auto-suscribe los syscalls auxiliares (clone, fork, setsid, procexit,
+  # ioctl, etc.) que pueblan ese estado en libsinsp.
+  #
+  # Sin esto, los rules built-in que filtran por 'proc.tty != 0' nunca
+  # disparan porque proc.tty siempre vale 0 (el árbol de procesos no
+  # tiene los datos para poblarlo). Este es exactamente el síntoma que
+  # observamos al instalar el chart con sus defaults.
+  #
+  # En producción 'repair: true' tiene un coste de CPU pequeño pero real
+  # (más syscalls capturados); en un lab es absolutamente correcto
+  # activarlo, y de hecho es lo que esperarías que fuera el default.
+  base_syscalls:
+    repair: true

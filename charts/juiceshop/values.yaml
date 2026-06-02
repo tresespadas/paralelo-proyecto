@@ -1,0 +1,65 @@
+# charts/juiceshop/values.yaml
+#
+# Defaults del chart. Mismo pattern que charts/dvwa: portable aquí,
+# overrides "de entorno" en values/juiceshop.yaml.
+
+image:
+  # bkimminich/juice-shop: imagen oficial mantenida por el creator del
+  # proyecto OWASP Juice Shop. Auto-contenida (Node + sqlite efímera
+  # en /tmp). Sin BD externa.
+  repository: bkimminich/juice-shop
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Pin a worker1 — coherente con DVWA, WebGoat y Suricata.
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+tolerations: []
+
+# Service NodePort. 31592 elegido para coherencia con proyecto/.
+service:
+  type: NodePort
+  port: 3000          # Puerto interno (Express default)
+  nodePort: 31592     # Puerto expuesto en el nodo
+
+# Persistencia DESACTIVADA. Juice Shop crea data/juiceshop.sqlite al
+# arrancar y la deja en el filesystem del container. Toda alteración
+# (usuarios creados, retos completados) se pierde con el restart.
+# Asumido: para detección de ataques no nos importa el progreso.
+#
+# Si quisiéramos persistirla, hay que pre-crear /mnt/data/juiceshop
+# con chown 65532:0 (UID nonroot estándar de la imagen distroless de
+# Juice Shop — verificar con `docker inspect bkimminich/juice-shop`
+# antes de aplicar).
+persistence:
+  enabled: false
+
+# Recursos. Node.js es bastante austero — ~80Mi RSS estable.
+# Margen 192Mi para que el GC no estrese y para soportar bursts
+# de peticiones concurrentes durante un scan de Kali.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 192Mi
+
+# Probes. Juice Shop arranca en ~10-15s (Node + bundle JS + seed sqlite).
+# / devuelve 200 con la SPA renderizada — endpoint canónico para probes.
+# /rest/admin/application-version es otra opción más liviana pero
+# devuelve JSON (kubelet acepta cualquier 2xx-3xx, da igual el body).
+probes:
+  liveness:
+    path: /
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    path: /
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3

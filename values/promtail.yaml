@@ -1,0 +1,32 @@
+# values/promtail.yaml — Promtail DaemonSet enviando logs a Loki interno
+
+# Override crítico: el default del chart apunta a 'http://loki-gateway/...',
+# el nginx reverse proxy que desactivamos en values/loki.yaml
+# (gateway.enabled: false). Apuntamos al Service regular de Loki por
+# DNS interno — puerto 3100, endpoint de push.
+config:
+  clients:
+    - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+
+# Tolerations: el default del chart incluye las de master y control-plane,
+# lo que haría correr Promtail en los 3 nodos. Lo restringimos a los
+# workers sobreescribiendo a lista vacía — sin tolerations, el DaemonSet
+# no schedulea en nodos con el taint 'node-role.kubernetes.io/control-plane'.
+# Coherente con el patrón de 'proyecto/' y con que node-exporter y
+# kube-state-metrics tampoco corren en master.
+tolerations: []
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+# ServiceMonitor: desactivado. Ese recurso es del Prometheus Operator
+# (CRD del chart kube-prometheus-stack) — nosotros usamos Prometheus
+# standalone, que no consume ServiceMonitors. Si lo dejásemos activado,
+# el chart crearía el recurso y el CRD no existiría → error en el
+# render. Apagarlo es higiene declarativa.
+serviceMonitor:
+  enabled: false

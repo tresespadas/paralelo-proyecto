@@ -1,0 +1,13 @@
+<network>
+  <name>red-prueba</name>
+  <forward mode='nat'/>
+  <bridge name='virbr2' stp='on' delay='0'/>
+  <ip address='10.0.1.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='10.0.1.2' end='10.0.1.254'/>
+      <host mac='52:54:00:00:01:10' name='test_master' ip='10.0.1.10'/>
+      <host mac='52:54:00:00:01:11' name='test_worker1' ip='10.0.1.11'/>
+      <host mac='52:54:00:00:01:12' name='test_worker2' ip='10.0.1.12'/>
+    </dhcp>
+  </ip>
+</network>

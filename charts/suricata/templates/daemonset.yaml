@@ -1,0 +1,172 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "suricata.fullname" . }}
+  labels:
+    {{- include "suricata.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "suricata.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "suricata.selectorLabels" . | nindent 8 }}
+    spec:
+      # nodeSelector + tolerations vacías = "schedulea solo donde matchea
+      # la etiqueta Y no haya taints que tolerar". En la práctica con
+      # nodeSelector hostname=worker1 → exactamente 1 pod.
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+
+      # hostNetwork: el toggle crítico — pod comparte netns del nodo,
+      # ve eth0 entera. Sin esto Suricata captura 0 paquetes útiles.
+      hostNetwork: {{ .Values.hostNetwork }}
+      # dnsPolicy debe ser ClusterFirstWithHostNet cuando hostNetwork=true,
+      # si no el pod hereda /etc/resolv.conf del NODO (sin DNS del cluster).
+      # Ojo: en este pod no resolvemos servicios K8s, pero por higiene.
+      dnsPolicy: ClusterFirstWithHostNet
+
+      {{- if .Values.suricataUpdate.enabled }}
+      ###########################################################################
+      # initContainer: descargar el ruleset ET Open ANTES de arrancar Suricata.
+      # Si esto falla (sin internet, registry caído), el pod queda en
+      # Init:CrashLoopBackOff con error claro — preferible a Suricata corriendo
+      # con reglas obsoletas en silencio.
+      ###########################################################################
+      initContainers:
+        - name: rules-update
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # suricata-update VIENE en la imagen oficial. Comando:
+          #   --no-test  → no validar con suricata-test (tarda y necesita su CLI completa)
+          #   --output   → directorio destino para suricata.rules compilado
+          # El emptyDir 'rules' se comparte con el container principal, que
+          # luego carga /var/lib/suricata/rules/suricata.rules.
+          command: ["suricata-update"]
+          args:
+            - "--no-test"
+            - "--output=/var/lib/suricata/rules"
+            - "--data-dir=/var/lib/suricata"
+            - "--config=/etc/suricata/update.yaml"
+          volumeMounts:
+            - name: rules
+              mountPath: /var/lib/suricata
+            - name: config
+              mountPath: /etc/suricata/update.yaml
+              subPath: update.yaml
+              readOnly: true
+      {{- end }}
+
+      containers:
+        ###########################################################################
+        # MAIN: Suricata. Captura paquetes, evalúa reglas, escribe eve.json.
+        ###########################################################################
+        - name: suricata
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # command: bypassea el ENTRYPOINT de la imagen (un script de
+          # setup que intenta chown /etc/suricata/suricata.yaml — falla
+          # con "Read-only file system" porque ConfigMap-mounted files
+          # son read-only a nivel de kernel, no de permisos. Ni siquiera
+          # root puede chownarlos). Saltamos directo al binario.
+          #
+          # Args:
+          #   -c     → archivo de config principal
+          #   -i     → interfaz a capturar (af-packet)
+          #   --runmode autofp → un thread captura, varios procesan
+          #                      (fastest path para IDS pasivo)
+          command:
+            - "suricata"
+          args:
+            - "-c"
+            - "/etc/suricata/suricata.yaml"
+            - "-i"
+            - "{{ .Values.suricata.interface }}"
+            - "--runmode=autofp"
+          securityContext:
+            # Capabilities granulares: NO usamos privileged: true.
+            # NET_ADMIN+NET_RAW = captura af-packet; SYS_NICE = thread priority.
+            capabilities:
+              {{- toYaml .Values.securityContext.capabilities | nindent 14 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            # subPath = monta SOLO el archivo, no el directorio entero.
+            # Sin subPath, el ConfigMap shadowearía /etc/suricata completo
+            # y el entrypoint de la imagen (que copia classification.config,
+            # reference.config, etc. al arrancar) fallaría con
+            # "Read-only file system".
+            - name: config
+              mountPath: /etc/suricata/suricata.yaml
+              subPath: suricata.yaml
+              readOnly: true
+            - name: rules
+              mountPath: /var/lib/suricata
+            - name: logs
+              mountPath: /var/log/suricata
+
+        ###########################################################################
+        # SIDECAR: tail -F eve.json → stdout. Promtail recoge el stdout
+        # de cualquier container del namespace 'security' y lo manda a Loki.
+        # Por eso Suricata escribe a archivo y dejamos que el sidecar haga
+        # el shipping — separación limpia de responsabilidades.
+        ###########################################################################
+        - name: log-tail
+          # Reusamos la imagen principal — bypassea cualquier issue de pull
+          # con un segundo registry y aprovecha que ya está cacheada.
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # tail -F (mayúscula): re-abre el archivo si Suricata lo rota.
+          # tail -f (minúscula) se quedaría leyendo el inode antiguo.
+          # `until` espera a que el archivo aparezca (initContainer ya corrió,
+          # pero Suricata necesita unos ms para abrir el primer write).
+          command:
+            - "sh"
+            - "-c"
+            - |
+              until [ -f /var/log/suricata/eve.json ]; do
+                echo "[log-tail] esperando a que Suricata cree eve.json..."
+                sleep 1
+              done
+              exec tail -F /var/log/suricata/eve.json
+          # Sidecar SOLO LEE — no necesita capabilities ni acceso de escritura.
+          # Defensa en profundidad: un compromiso del sidecar no puede
+          # manipular logs ni capturar tráfico.
+          # No fijamos readOnlyRootFilesystem porque la imagen jasonish/suricata
+          # ejecuta scripts de entrypoint que escriben en /tmp y /var/lib/suricata
+          # al arrancar, aunque aquí ignoremos su CMD por completo. drop ALL
+          # ya elimina la mayoría del riesgo sin romper el arranque.
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+          volumeMounts:
+            - name: logs
+              mountPath: /var/log/suricata
+              readOnly: true
+
+      volumes:
+        # config: ConfigMap con suricata.yaml + update.yaml.
+        - name: config
+          configMap:
+            name: {{ include "suricata.fullname" . }}-config
+        # rules: emptyDir compartido entre initContainer (escribe) y main (lee).
+        # No persiste entre restarts del pod — el initContainer re-descarga.
+        - name: rules
+          emptyDir: {}
+        # logs: emptyDir compartido entre main (escribe eve.json) y sidecar (tail).
+        # No persiste — los eventos ya van a Loki, perder los archivos
+        # locales tras un restart no afecta nada.
+        - name: logs
+          emptyDir: {}

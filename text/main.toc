@@ -1,0 +1,120 @@
+\babel@toc {spanish}{}\relax 
+\contentsline {section}{\numberline {1}Fase 1 -- Preparación de infraestructura}{3}{section.1}%
+\contentsline {subsection}{\numberline {1.1}Objetivo}{3}{subsection.1.1}%
+\contentsline {subsection}{\numberline {1.2}Requisitos de la infraestructura}{3}{subsection.1.2}%
+\contentsline {subsection}{\numberline {1.3}Instalación de paquetería en el \emph {host}}{3}{subsection.1.3}%
+\contentsline {subsection}{\numberline {1.4}Definición de la red privada}{4}{subsection.1.4}%
+\contentsline {paragraph}{Comprobación previa al \texttt {up}.}{4}{section*.2}%
+\contentsline {subsection}{\numberline {1.5}Vagrantfile}{5}{subsection.1.5}%
+\contentsline {paragraph}{Despliegue secuencial.}{6}{section*.3}%
+\contentsline {paragraph}{Provisioners \texttt {run: "never"}.}{6}{section*.4}%
+\contentsline {subsection}{\numberline {1.6}Provisioners de fase 0 (\texttt {config.sh} y \texttt {ssh-setup.sh})}{6}{subsection.1.6}%
+\contentsline {subsubsection}{\numberline {1.6.1}\texttt {config.sh}}{6}{subsubsection.1.6.1}%
+\contentsline {subsubsection}{\numberline {1.6.2}\texttt {ssh-setup.sh}}{6}{subsubsection.1.6.2}%
+\contentsline {subsection}{\numberline {1.7}Trigger \texttt {ssh-config.sh}}{7}{subsection.1.7}%
+\contentsline {subsection}{\numberline {1.8}Discos persistentes}{7}{subsection.1.8}%
+\contentsline {subsubsection}{\numberline {1.8.1}Decisión arquitectónica}{7}{subsubsection.1.8.1}%
+\contentsline {subsubsection}{\numberline {1.8.2}\texttt {create-disks.sh} (\emph {trigger} en el host)}{7}{subsubsection.1.8.2}%
+\contentsline {subsubsection}{\numberline {1.8.3}\texttt {attach-disks.sh} (\emph {trigger} en el host)}{7}{subsubsection.1.8.3}%
+\contentsline {subsection}{\numberline {1.9}Acceso gráfico a las VMs}{8}{subsection.1.9}%
+\contentsline {subsection}{\numberline {1.10}Resumen del estado tras Fase 1}{8}{subsection.1.10}%
+\contentsline {section}{\numberline {2}Fase 2 -- Despliegue del clúster Kubernetes}{8}{section.2}%
+\contentsline {subsection}{\numberline {2.1}Objetivo}{8}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}Por qué Kubespray}{8}{subsection.2.2}%
+\contentsline {subsection}{\numberline {2.3}Estructura del \emph {script} \texttt {setup-kubespray.sh}}{9}{subsection.2.3}%
+\contentsline {subsubsection}{\numberline {2.3.1}Fase 1: Clonado de Kubespray}{9}{subsubsection.2.3.1}%
+\contentsline {subsubsection}{\numberline {2.3.2}Fase 2: Entorno virtual de Python}{9}{subsubsection.2.3.2}%
+\contentsline {subsubsection}{\numberline {2.3.3}Fase 3: Generación del inventario}{9}{subsubsection.2.3.3}%
+\contentsline {subsubsection}{\numberline {2.3.4}Fase 4: Configuración de \texttt {group\_vars}}{10}{subsubsection.2.3.4}%
+\contentsline {subsubsection}{\numberline {2.3.5}Fase 5: Ejecución del \emph {playbook}}{10}{subsubsection.2.3.5}%
+\contentsline {subsubsection}{\numberline {2.3.6}Fase 6: Instalación de \texttt {kubeconfig}}{10}{subsubsection.2.3.6}%
+\contentsline {subsubsection}{\numberline {2.3.7}Fase 7: Creación de \emph {namespaces}}{10}{subsubsection.2.3.7}%
+\contentsline {subsection}{\numberline {2.4}Validación post-despliegue}{11}{subsection.2.4}%
+\contentsline {subsection}{\numberline {2.5}Lecciones y \emph {gotchas} encontradas}{11}{subsection.2.5}%
+\contentsline {subsubsection}{\numberline {2.5.1}Re-exec a usuario \texttt {master} con \texttt {chmod a+r}}{11}{subsubsection.2.5.1}%
+\contentsline {subsubsection}{\numberline {2.5.2}Per-host \texttt {ansible\_user}}{11}{subsubsection.2.5.2}%
+\contentsline {subsubsection}{\numberline {2.5.3}Inter-node SSH \emph {passwordless}}{11}{subsubsection.2.5.3}%
+\contentsline {subsubsection}{\numberline {2.5.4}Idempotencia del clúster}{11}{subsubsection.2.5.4}%
+\contentsline {section}{\numberline {3}Fase 3 -- \emph {Stack} de monitorización}{11}{section.3}%
+\contentsline {subsection}{\numberline {3.1}Objetivo}{11}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}Arquitectura}{12}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}Volúmenes persistentes vía \texttt {hostPath}}{12}{subsection.3.3}%
+\contentsline {paragraph}{Caso especial Loki.}{12}{section*.5}%
+\contentsline {paragraph}{Permisos \texttt {chown}.}{12}{section*.6}%
+\contentsline {subsection}{\numberline {3.4}Grafana}{13}{subsection.3.4}%
+\contentsline {subsubsection}{\numberline {3.4.1}Despliegue}{13}{subsubsection.3.4.1}%
+\contentsline {subsubsection}{\numberline {3.4.2}Provisioning declarativo de \emph {datasources}}{13}{subsubsection.3.4.2}%
+\contentsline {paragraph}{El bloque \texttt {deleteDatasources} (defensivo).}{13}{section*.7}%
+\contentsline {subsubsection}{\numberline {3.4.3}Provisioning declarativo de \emph {dashboards}}{14}{subsubsection.3.4.3}%
+\contentsline {paragraph}{Paneles ``\% por nodo''.}{14}{section*.8}%
+\contentsline {subsection}{\numberline {3.5}Prometheus}{14}{subsection.3.5}%
+\contentsline {paragraph}{El bug del \emph {doble \emph {scrape}}.}{14}{section*.9}%
+\contentsline {paragraph}{Solución adoptada.}{15}{section*.10}%
+\contentsline {paragraph}{Gotcha \texttt {extraScrapeConfigs} es \emph {top-level}.}{15}{section*.11}%
+\contentsline {subsection}{\numberline {3.6}Loki}{15}{subsection.3.6}%
+\contentsline {subsubsection}{\numberline {3.6.1}Modo \texttt {SingleBinary}}{15}{subsubsection.3.6.1}%
+\contentsline {subsubsection}{\numberline {3.6.2}Configuración base}{15}{subsubsection.3.6.2}%
+\contentsline {subsubsection}{\numberline {3.6.3}\emph {Sizing} bajo \emph {pen-test flood}}{15}{subsubsection.3.6.3}%
+\contentsline {subsubsection}{\numberline {3.6.4}Tamaño máximo de mensaje gRPC}{16}{subsubsection.3.6.4}%
+\contentsline {subsubsection}{\numberline {3.6.5}Límites de \emph {query}}{16}{subsubsection.3.6.5}%
+\contentsline {subsection}{\numberline {3.7}Promtail}{16}{subsection.3.7}%
+\contentsline {paragraph}{El \emph {override} crítico de la URL.}{16}{section*.12}%
+\contentsline {paragraph}{\texttt {serviceMonitor: false}.}{16}{section*.13}%
+\contentsline {paragraph}{Deprecation.}{16}{section*.14}%
+\contentsline {subsection}{\numberline {3.8}Convención de \emph {labels} en LogQL}{17}{subsection.3.8}%
+\contentsline {subsection}{\numberline {3.9}El \emph {script} \texttt {setup-lab.sh}}{17}{subsection.3.9}%
+\contentsline {section}{\numberline {4}Fase 4 -- \emph {Stack} de seguridad y CMS vulnerables}{17}{section.4}%
+\contentsline {subsection}{\numberline {4.1}Objetivo}{17}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}Arquitectura}{17}{subsection.4.2}%
+\contentsline {subsection}{\numberline {4.3}Concentración en worker1}{18}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}Falco}{18}{subsection.4.4}%
+\contentsline {subsubsection}{\numberline {4.4.1}Driver \texttt {modern\_ebpf}}{18}{subsubsection.4.4.1}%
+\contentsline {subsubsection}{\numberline {4.4.2}Salida JSON a \texttt {stdout}}{18}{subsubsection.4.4.2}%
+\contentsline {subsubsection}{\numberline {4.4.3}El parámetro \texttt {base\_syscalls.repair}}{18}{subsubsection.4.4.3}%
+\contentsline {subsubsection}{\numberline {4.4.4}Regla custom: ``Lab --- Shell en container''}{19}{subsubsection.4.4.4}%
+\contentsline {paragraph}{Iteración hasta la regla final.}{19}{section*.15}%
+\contentsline {paragraph}{Refinamiento.}{19}{section*.16}%
+\contentsline {subsubsection}{\numberline {4.4.5}\texttt {customRules} y \texttt {rules\_files}: la trampa}{19}{subsubsection.4.4.5}%
+\contentsline {subsection}{\numberline {4.5}Suricata}{19}{subsection.4.5}%
+\contentsline {subsubsection}{\numberline {4.5.1}\texttt {hostNetwork} y \emph {capabilities}}{20}{subsubsection.4.5.1}%
+\contentsline {paragraph}{\texttt {dnsPolicy: ClusterFirstWithHostNet}.}{20}{section*.17}%
+\contentsline {subsubsection}{\numberline {4.5.2}Captura con \texttt {af-packet}}{20}{subsubsection.4.5.2}%
+\contentsline {subsubsection}{\numberline {4.5.3}Variables de red: \texttt {HOME\_NET} y \texttt {HTTP\_PORTS}}{20}{subsubsection.4.5.3}%
+\contentsline {paragraph}{Diseño del \texttt {HOME\_NET}.}{20}{section*.18}%
+\contentsline {paragraph}{\texttt {HTTP\_PORTS} parametrizado.}{20}{section*.19}%
+\contentsline {subsubsection}{\numberline {4.5.4}El \emph {init container}: descarga del \emph {ruleset} ET Open}{21}{subsubsection.4.5.4}%
+\contentsline {paragraph}{URL directa frente al alias \texttt {et/open}.}{21}{lstlisting.-46}%
+\contentsline {subsubsection}{\numberline {4.5.5}El \emph {sidecar} \texttt {tail -F eve.json}}{21}{subsubsection.4.5.5}%
+\contentsline {paragraph}{Reuso de la imagen principal.}{21}{section*.21}%
+\contentsline {paragraph}{Defensa en profundidad.}{21}{section*.22}%
+\contentsline {subsubsection}{\numberline {4.5.6}Coherencia config: \texttt {stats}}{22}{subsubsection.4.5.6}%
+\contentsline {subsection}{\numberline {4.6}DVWA --- \emph {Damn Vulnerable Web Application}}{22}{subsection.4.6}%
+\contentsline {subsubsection}{\numberline {4.6.1}Imagen \texttt {vulnerables/web-dvwa}}{22}{subsubsection.4.6.1}%
+\contentsline {subsubsection}{\numberline {4.6.2}Sin persistencia (decisión consciente)}{22}{subsubsection.4.6.2}%
+\contentsline {subsubsection}{\numberline {4.6.3}Probe \texttt {/login.php}}{22}{subsubsection.4.6.3}%
+\contentsline {subsubsection}{\numberline {4.6.4}\texttt {strategy: Recreate}}{22}{subsubsection.4.6.4}%
+\contentsline {subsection}{\numberline {4.7}WebGoat}{23}{subsection.4.7}%
+\contentsline {subsubsection}{\numberline {4.7.1}Imagen oficial}{23}{subsubsection.4.7.1}%
+\contentsline {subsubsection}{\numberline {4.7.2}Variables de entorno críticas}{23}{subsubsection.4.7.2}%
+\contentsline {paragraph}{\texttt {WEBGOAT\_HOST=0.0.0.0}.}{23}{section*.23}%
+\contentsline {paragraph}{\texttt {JAVA\_TOOL\_OPTIONS} para acotar el \emph {heap}.}{23}{section*.24}%
+\contentsline {subsubsection}{\numberline {4.7.3}URL \emph {case-sensitive}: \texttt {/WebGoat}}{23}{subsubsection.4.7.3}%
+\contentsline {subsection}{\numberline {4.8}Juice Shop}{23}{subsection.4.8}%
+\contentsline {subsubsection}{\numberline {4.8.1}Despliegue mínimo}{23}{subsubsection.4.8.1}%
+\contentsline {subsubsection}{\numberline {4.8.2}Sin login inicial}{23}{subsubsection.4.8.2}%
+\contentsline {subsection}{\numberline {4.9}El \emph {script} \texttt {setup-security.sh}}{24}{subsection.4.9}%
+\contentsline {subsection}{\numberline {4.10}Lecciones transversales}{24}{subsection.4.10}%
+\contentsline {subsubsection}{\numberline {4.10.1}Charts custom: límite a Helm \emph {upstream}}{24}{subsubsection.4.10.1}%
+\contentsline {subsubsection}{\numberline {4.10.2}Imágenes con \emph {defaults} hostiles a \texttt {NodePort}}{24}{subsubsection.4.10.2}%
+\contentsline {subsubsection}{\numberline {4.10.3}Detectores silenciosamente rotos}{24}{subsubsection.4.10.3}%
+\contentsline {subsection}{\numberline {4.11}Estado tras Fase 4}{25}{subsection.4.11}%
+\contentsline {section}{\numberline {A}Scripts}{25}{appendix.A}%
+\contentsline {subsection}{\numberline {A.1}\texttt {network-check.sh}}{25}{subsection.A.1}%
+\contentsline {subsection}{\numberline {A.2}\texttt {create-disks.sh}}{25}{subsection.A.2}%
+\contentsline {subsection}{\numberline {A.3}\texttt {config.sh}}{26}{subsection.A.3}%
+\contentsline {subsection}{\numberline {A.4}\texttt {ssh-setup.sh}}{26}{subsection.A.4}%
+\contentsline {subsection}{\numberline {A.5}\texttt {ssh-config.sh}}{27}{subsection.A.5}%
+\contentsline {subsection}{\numberline {A.6}\texttt {attach-disks.sh}}{27}{subsection.A.6}%
+\contentsline {subsection}{\numberline {A.7}\texttt {setup-kubespray.sh}}{29}{subsection.A.7}%
+\contentsline {subsection}{\numberline {A.8}\texttt {setup-lab.sh}}{31}{subsection.A.8}%
+\contentsline {subsection}{\numberline {A.9}\texttt {setup-security.sh}}{33}{subsection.A.9}%

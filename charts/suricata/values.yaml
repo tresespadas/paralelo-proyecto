@@ -1,0 +1,106 @@
+# charts/suricata/values.yaml
+#
+# Defaults del chart. Lo que esperamos OVERRIDEAR vive en /vagrant/values/suricata.yaml
+# (al margen del chart, junto a grafana.yaml/prometheus.yaml/etc.). Lo que vive aquí
+# es el "contrato del chart": lo que cualquier instalador puede asumir como default.
+
+image:
+  repository: jasonish/suricata
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Imagen del initContainer que descarga el ruleset ET Open.
+# 'suricata-update' viene EN la imagen principal de Suricata, así que reusamos
+# la misma imagen — evita un pull extra y garantiza versión consistente.
+suricataUpdate:
+  enabled: true
+
+# Sidecar que tail -F eve.json a stdout, para que Promtail lo recoja.
+# Reutilizamos la imagen principal de Suricata (jasonish/suricata) en lugar
+# de un busybox aparte. Razones:
+#   - tail está disponible en /usr/bin/tail (GNU tail, soporta -F)
+#   - Cero pulls extra: la imagen ya está cacheada para el container principal
+#   - Sin dependencia de Docker Hub para una segunda imagen — busybox vive
+#     en blobs hospedados en Cloudflare R2 que pueden tener IPs no enrutables
+#     desde algunas redes (visto en este lab con 172.64.66.1)
+# Trade-off: el sidecar arranca con 139MB de imagen en vez de 5MB, pero
+# no añade memoria real (mismo set de layers compartido con el main).
+
+# nodeSelector: PIN al nodo donde corre DVWA. DaemonSet ≠ "todos los nodos"
+# cuando hay nodeSelector — solo el nodo que matchea.
+# El hostname OS en este lab es 'worker1' (sin prefijo 'test-' del Vagrant
+# VM name) — kubelet usa `hostname`, no el nombre de la VM.
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+# tolerations vacías = NO toleramos taints, NO vamos a master.
+# Coherente con el resto del stack del lab (Promtail, Falco, etc.).
+tolerations: []
+
+# hostNetwork: SIN ESTO Suricata no ve nada útil — solo el netns vacío
+# del propio pod. Con true comparte el netns del nodo y captura eth0
+# entera, donde llega el tráfico de Kali contra DVWA.
+hostNetwork: true
+
+# Capabilities mínimas necesarias para captura af-packet:
+# - NET_ADMIN: setear modo promiscuo, configurar ring buffer TPACKET_V3
+# - NET_RAW:   crear sockets AF_PACKET (capa 2 — Ethernet completo)
+# - SYS_NICE:  cambiar prioridad de threads de captura (CPU pinning)
+# Notar: NO necesitamos privileged: true. El kernel Linux permite hacer
+# todo esto con capabilities granulares, sin dar acceso total al host.
+securityContext:
+  capabilities:
+    add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+
+# Resources contenidos. Lección del vault: worker1 con 2GB de RAM
+# se queda al 91% con vulnerables + IDS. Limits altos para picos de
+# evaluación de reglas; requests bajos para no bloquear scheduling.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Configuración de Suricata propiamente dicha.
+# Estos valores se inyectan en el ConfigMap (templates/configmap.yaml)
+# y de ahí al /etc/suricata/suricata.yaml dentro del pod.
+suricata:
+  # Interfaz a escuchar en modo IDS (af-packet pasivo, no NFQUEUE/IPS).
+  # Confirmado en worker1: eth0 = 10.0.1.11/24 (red red-prueba).
+  interface: eth0
+
+  # Redes "internas" desde el punto de vista de las reglas.
+  # ET Open distingue HOME_NET (lo que protegemos) de EXTERNAL_NET
+  # (de donde vienen los ataques). Marcamos el rango del lab como home;
+  # cualquier otra IP es "external" — incluida Kali si la añadiéramos.
+  homeNet: "[10.0.1.0/24,10.233.0.0/16]"
+
+  # Nivel de log del proceso Suricata (no de los eventos detectados).
+  # 'notice' = arranque, recargas, errores. 'info' es muy verboso.
+  logLevel: notice
+
+  # Puertos que Suricata trata como "tráfico HTTP" — las firmas ET WEB_SERVER
+  # están escritas en términos de $HTTP_PORTS (ej: `flow:to_server,established;
+  # http.uri; content:"UNION SELECT"`). Si un CMS expone en un puerto que
+  # NO está aquí, Suricata lo ve como TCP genérico y las firmas web no
+  # disparan — los logs http/alert quedan vacíos sin ningún error visible.
+  #
+  # Puertos del lab:
+  #   - 80     → puerto canónico HTTP (cualquier listener interno)
+  #   - 30430  → DVWA NodePort
+  #   - 30380  → WebGoat NodePort
+  #   - 31592  → Juice Shop NodePort
+  #
+  # Nota: el template usa `join ","` que acepta lista de ints (sprig hace
+  # cast con fmt.Sprint vía reflect), así que aquí van como ints — más
+  # legible que strings entrecomillados.
+  httpPorts:
+    - 80
+    - 30430
+    - 30380
+    - 31592

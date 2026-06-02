@@ -1,0 +1,24 @@
+# NOTA: a diferencia de grafana-pv.yaml / prometheus-pv.yaml, aquí solo
+# declaramos el PV — NO el PVC. Razón: Loki SingleBinary es un StatefulSet,
+# y los StatefulSets generan sus propios PVCs vía volumeClaimTemplates
+# (con nombre autogenerado tipo `storage-loki-0`).
+#
+# El binding entre PVC autogenerado y este PV ocurre por MATCHING:
+#   - capacity.storage    → el PVC pide 5Gi y el PV tiene 5Gi
+#   - accessModes          → ambos ReadWriteOnce
+#   - storageClassName     → ambos "" (sin StorageClass)
+# No hay volumeName explícito; el scheduler empareja por esos 3 campos.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: loki-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /mnt/data/loki
+    type: DirectoryOrCreate

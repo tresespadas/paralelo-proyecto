@@ -1,0 +1,76 @@
+# charts/dvwa/values.yaml
+#
+# Defaults del chart. Igual patrón que charts/suricata: lo que es portable
+# vive aquí; lo de entorno (worker concreto, NodePort específico) en values/dvwa.yaml.
+
+image:
+  # vulnerables/web-dvwa: versión "todo en uno" — Apache + PHP + MySQL
+  # embebido. Lección del vault: simplifica vs ghcr.io/digininja/dvwa
+  # (oficial pero requiere MariaDB aparte como segundo Deployment).
+  # Para un lab de detección, el "web-dvwa" basta.
+  repository: vulnerables/web-dvwa
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Pin a worker1 (donde corre Suricata). Suricata necesita ver el tráfico
+# del nodo víctima — si DVWA migra de nodo, Suricata pierde visibilidad.
+# Hostname OS = 'worker1' (no 'test-worker1' — eso es el VM name Vagrant).
+nodeSelector:
+  kubernetes.io/hostname: worker1
+
+tolerations: []
+
+# Service NodePort — acceso desde fuera del cluster (Kali en el futuro).
+# 30430 elegido para consistencia con el lab de proyecto/ original.
+service:
+  type: NodePort
+  port: 80          # Puerto interno (Apache en el container)
+  nodePort: 30430   # Puerto expuesto en el nodo
+
+# Persistencia DESACTIVADA — decisión consciente.
+# La imagen vulnerables/web-dvwa viene con la BD MariaDB INICIALIZADA
+# y horneada en la imagen (en /var/lib/mysql). Su entrypoint (/main.sh)
+# es minimalista — solo hace `service mysql start`, NO ejecuta
+# mysql_install_db. Si montamos un PVC encima de /var/lib/mysql, el
+# mount shadowea la BD pre-cocinada → datadir vacío → mysqld arranca
+# pero falla con "Table 'mysql.user' doesn't exist" porque las tablas
+# de sistema no existen.
+#
+# Alternativas descartadas:
+#   - Pre-popular el PV con un initContainer que copie la BD baked.
+#   - Añadir un initContainer con mysql_install_db.
+# Ambas añaden complejidad sin beneficio práctico para un lab donde
+# DVWA se resetea constantemente vía /setup.php.
+#
+# Trade-off aceptado: cada pod restart obliga a re-hacer el setup desde
+# la UI ("Create / Reset Database"). Tarda ~5s. Para un lab de detección
+# de ataques, irrelevante — el reset es parte del workflow normal.
+persistence:
+  enabled: false
+
+# Recursos. Lección del vault: worker1 con stack completo va al 91% RAM.
+# DVWA con MySQL embebido es el componente más pesado del namespace
+# 'vulnerable' — generoso con limits para el setup inicial de la BD,
+# requests bajos para no acaparar.
+resources:
+  requests:
+    cpu: 25m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Probes — qué considera kubelet "vivo" y "listo".
+# /login.php devuelve 200 OK incluso sin haber hecho el setup inicial
+# de la BD, así que es el endpoint canónico para ambos probes.
+# Si usáramos /, devuelve 302 → /setup.php hasta que se inicializa,
+# y kubelet lo trataría como "ready" prematuramente.
+probes:
+  liveness:
+    path: /login.php
+    initialDelaySeconds: 30   # Apache + MySQL tardan ~20s en arrancar
+    periodSeconds: 30
+  readiness:
+    path: /login.php
+    initialDelaySeconds: 10
+    periodSeconds: 10

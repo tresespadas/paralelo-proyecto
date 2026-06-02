@@ -1,0 +1,25 @@
+apiVersion: v2
+name: webgoat
+description: |
+  WebGoat (OWASP) standalone para el lab paralelo-proyecto.
+  Deployment 1-replica en worker1, namespace 'vulnerable'. Imagen oficial
+  `webgoat/webgoat` — Spring Boot autocontenido, expone 8080 (WebGoat
+  principal) y 9090 (WebWolf, hosting de payloads). Service NodePort en
+  30380 expone solo WebGoat — WebWolf queda accesible vía port-forward
+  cuando lo necesitemos para los retos de XSS reflectivo.
+type: application
+
+# version del CHART. appVersion = de la APP. WebGoat upstream usa 'latest'
+# como tag canónico — no publican semver estable, los releases son por
+# fecha y el `latest` es lo que se mantiene.
+version: 0.1.0
+appVersion: "latest"
+
+keywords:
+  - vulnerable
+  - lab
+  - webgoat
+  - owasp
+  - security-testing
+maintainers:
+  - name: paralelo-proyecto

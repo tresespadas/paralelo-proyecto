@@ -1,0 +1,696 @@
+# values/grafana.yaml — standalone Grafana install
+
+adminUser: admin
+adminPassword: admin
+
+persistence:
+  enabled: true
+  existingClaim: grafana-pvc
+
+service:
+  type: NodePort
+  nodePort: 30711
+
+nodeSelector:
+  kubernetes.io/hostname: worker2
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+# Desactivamos el init container busybox que hace chown al volumen.
+# Ya hicimos el chown a mano (UID 472) en /mnt/data/grafana en worker2,
+# así que este init container es redundante — y además nos desacopla
+# de tener que pulear docker.io/library/busybox:1.31.1.
+initChownData:
+  enabled: false
+
+# Datasources provisionados declarativamente vía ConfigMap.
+# Grafana los carga al arrancar el pod desde el ConfigMap que el chart
+# genera con esta sección. Sustituye al patrón anterior de cablearlos
+# via API (POST /api/datasources) tras la instalación.
+#
+# Ventajas:
+#   - Versionados en git (este archivo es la fuente de verdad).
+#   - Idempotentes — Grafana reconcilia en cada restart.
+#   - Aparecen marcados como 'Provisioned' en la UI: candado de solo
+#     lectura, edición forzada vía values + helm upgrade.
+#
+# Convención: el archivo virtual se llama 'datasources.yaml' (clave
+# top-level dentro del map 'datasources'). Su `apiVersion: 1` es de
+# Grafana provisioning, NO la apiVersion de Kubernetes.
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    # deleteDatasources se ejecuta ANTES del bloque 'datasources' en cada
+    # arranque del pod. Borra por (name, orgId) y permite reinsertar limpio.
+    #
+    # Por qué lo necesitamos: el primer install creó Prometheus/Loki sin
+    # `uid:` explícito, así que Grafana asignó UUIDs autogenerados y los
+    # guardó en la sqlite del PVC. Al introducir luego `uid: prometheus`
+    # / `uid: loki`, el reconciliado del provisioner falla:
+    #   - busca por uid → no existe (registro viejo tiene UUID distinto)
+    #   - intenta insertar → colisiona por (name) único en la tabla
+    #   - resultado: "data source not found" + crash loop del pod.
+    #
+    # Idempotente: en arranques siguientes el delete es no-op (la entrada
+    # ya quedó alineada al uid declarado) y el insert reaplica los mismos
+    # valores. Coste: un par de líneas en logs por arranque.
+    deleteDatasources:
+      - name: Prometheus
+        orgId: 1
+      - name: Loki
+        orgId: 1
+    datasources:
+      - name: Prometheus
+        # uid explícito → estable entre reinstalaciones. Sin esto Grafana
+        # genera un UUID aleatorio y cualquier dashboard provisionado que
+        # referencie el datasource por uid queda colgando tras un reinstall
+        # con PVC limpio. Pinearlo desacopla dashboards de runtime state.
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus-server.monitoring.svc.cluster.local
+        isDefault: true
+      - name: Loki
+        uid: loki
+        type: loki
+        access: proxy
+        url: http://loki.monitoring.svc.cluster.local:3100
+
+# Dashboards provisionados — el chart genera un ConfigMap por dashboard
+# y lo monta en /var/lib/grafana/dashboards/<provider>/<dash>.json.
+# Grafana los carga al arrancar y reconcilia en cada helm upgrade.
+#
+# Patrón de dos pasos:
+#   1) dashboardProviders.providers.<name>: registra una "carpeta lógica"
+#      donde aparecerán los dashboards en la UI (carpeta "Lab" abajo).
+#   2) dashboards.<provider>.<key>.json: el dashboard inline en JSON.
+#
+# Ventaja sobre importar manualmente desde la UI: el dashboard vive
+# versionado en git, y un helm upgrade reaplica los cambios. Si alguien
+# lo edita desde la UI con `editable: true`, los cambios sobreviven a la
+# sesión pero se pisan en el siguiente upgrade — la fuente de verdad es
+# este archivo.
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: 'lab'
+        orgId: 1
+        folder: 'Lab'
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards/lab
+
+dashboards:
+  lab:
+    # security-overview: dashboard unificado seguridad + infraestructura.
+    #
+    # Estructura (revisión 2 — orientada a defensa de proyecto):
+    #   Variable: $cms (All / DVWA / WebGoat / JuiceShop) — filtra por
+    #     dest_port en las queries que tocan tráfico HTTP.
+    #   Filas:
+    #     1) Suricata — IDS de red    (afectada por $cms)
+    #     2) Falco — Runtime detection (sin $cms; sus eventos son
+    #         de syscalls en containers, no de tráfico HTTP)
+    #     3) Tráfico HTTP por CMS      (afectada por $cms)
+    #     4) Cluster Health             (siempre visible al final)
+    #
+    # Decisiones de filtrado de ruido:
+    #   - Suricata: en todos los paneles se excluye `alert_signature !~
+    #     "SURICATA .*"`, que descarta los falsos positivos del decoder
+    #     interno (Ethertype unknown, etc.) — son alertas técnicas de
+    #     captura, no de ataque.
+    #   - Falco: se excluye la regla "Read sensitive file untrusted"
+    #     cuando viene de namespaces sistema (kube-system, monitoring,
+    #     security, kube-flannel). Estos pods (kube-state-metrics,
+    #     coredns, promtail, etc.) leen el SA token cada pocos segundos
+    #     de forma legítima — saturarían el panel. El filtro se hace
+    #     a nivel de LogQL (no de regla Falco), así que Loki sigue
+    #     indexando todo: podemos mostrar el ruido bajo demanda en
+    #     Explore si surge la pregunta en la defensa.
+    #
+    # Datasources usados (uid):
+    #   - loki        → eventos JSON Suricata + Falco vía Promtail
+    #   - prometheus  → métricas node-exporter (CPU/mem/red/disco/fs)
+    security-overview:
+      json: |
+        {
+          "uid": "security-overview",
+          "title": "Security Overview — Suricata + Falco + Infra",
+          "tags": ["lab", "security"],
+          "timezone": "browser",
+          "schemaVersion": 39,
+          "version": 2,
+          "refresh": "30s",
+          "time": { "from": "now-15m", "to": "now" },
+          "timepicker": {},
+          "annotations": { "list": [] },
+          "templating": {
+            "list": [
+              {
+                "name": "cms",
+                "label": "CMS",
+                "description": "Filtra por puerto destino del CMS atacado. 'All' = .+, matchea cualquier dest_port presente.",
+                "type": "custom",
+                "query": "All : .+,DVWA : 30430,WebGoat : 30380,JuiceShop : 31592",
+                "current": { "selected": true, "text": "All", "value": ".+" },
+                "options": [
+                  { "text": "All", "value": ".+", "selected": true },
+                  { "text": "DVWA", "value": "30430", "selected": false },
+                  { "text": "WebGoat", "value": "30380", "selected": false },
+                  { "text": "JuiceShop", "value": "31592", "selected": false }
+                ],
+                "includeAll": false,
+                "multi": false,
+                "hide": 0
+              }
+            ]
+          },
+          "links": [],
+          "editable": true,
+          "graphTooltip": 1,
+          "panels": [
+            {
+              "id": 100,
+              "type": "row",
+              "title": "Suricata — IDS de red (filtra por $cms)",
+              "collapsed": false,
+              "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+              "panels": []
+            },
+            {
+              "id": 1,
+              "type": "timeseries",
+              "title": "Alertas Suricata/min por firma",
+              "description": "Conteo por minuto agrupado por firma. Excluye SURICATA .* (ruido del decoder). Filtra por $cms vía dest_port.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 8, "w": 16, "x": 0, "y": 1 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "sum by (alert_signature) (count_over_time({namespace=\"security\", app=\"suricata\"} | json | event_type=\"alert\" | alert_signature !~ \"SURICATA .*\" | dest_port =~ \"$cms\" [1m]))",
+                  "legendFormat": "{{alert_signature}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "fillOpacity": 80,
+                    "lineWidth": 1,
+                    "stacking": { "mode": "normal", "group": "A" }
+                  },
+                  "unit": "short"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi", "sort": "desc" }
+              }
+            },
+            {
+              "id": 2,
+              "type": "table",
+              "title": "Top firmas Suricata (1h)",
+              "description": "Top 10 firmas por número de alertas en la última hora. Excluye SURICATA .*. Filtra por $cms.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "topk(10, sum by (alert_signature) (count_over_time({namespace=\"security\", app=\"suricata\"} | json | event_type=\"alert\" | alert_signature !~ \"SURICATA .*\" | dest_port =~ \"$cms\" [1h])))",
+                  "instant": true,
+                  "legendFormat": ""
+                }
+              ],
+              "transformations": [
+                {
+                  "id": "organize",
+                  "options": {
+                    "excludeByName": { "Time": true },
+                    "renameByName": { "Value": "events", "alert_signature": "signature" }
+                  }
+                },
+                {
+                  "id": "sortBy",
+                  "options": {
+                    "fields": {},
+                    "sort": [{ "field": "events", "desc": true }]
+                  }
+                }
+              ],
+              "fieldConfig": {
+                "defaults": { "custom": { "align": "left" } },
+                "overrides": []
+              },
+              "options": { "showHeader": true }
+            },
+            {
+              "id": 3,
+              "type": "logs",
+              "title": "Stream de alertas Suricata",
+              "description": "Flujo crudo de alertas Suricata, ordenadas por timestamp descendente. Excluye SURICATA .* (ruido del decoder). Filtra por $cms vía dest_port. Click en cada línea para ver el JSON completo con MITRE ATT&CK metadata.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 10, "w": 24, "x": 0, "y": 9 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "{namespace=\"security\", app=\"suricata\"} | json | event_type=\"alert\" | alert_signature !~ \"SURICATA .*\" | dest_port =~ \"$cms\""
+                }
+              ],
+              "options": {
+                "showTime": true,
+                "showLabels": false,
+                "showCommonLabels": false,
+                "wrapLogMessage": true,
+                "prettifyLogMessage": false,
+                "enableLogDetails": true,
+                "dedupStrategy": "none",
+                "sortOrder": "Descending"
+              }
+            },
+            {
+              "id": 200,
+              "type": "row",
+              "title": "Falco — Runtime detection (eventos de syscalls en containers)",
+              "collapsed": false,
+              "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 },
+              "panels": []
+            },
+            {
+              "id": 4,
+              "type": "timeseries",
+              "title": "Eventos Falco/min por regla",
+              "description": "Conteo por minuto agrupado por regla. Excluye 'Read sensitive file untrusted' cuando viene de namespaces sistema (kube-system, monitoring, security, kube-flannel) — lecturas legítimas del SA token por componentes de infra.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 8, "w": 16, "x": 0, "y": 20 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "sum by (rule) (count_over_time({namespace=\"security\", app=\"falco\"} | json | rule != \"\" | rule != \"Read sensitive file untrusted\" or output_fields_k8s_ns_name !~ \"kube-system|monitoring|security|kube-flannel\" [1m]))",
+                  "legendFormat": "{{rule}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "fillOpacity": 80,
+                    "lineWidth": 1,
+                    "stacking": { "mode": "normal", "group": "A" }
+                  },
+                  "unit": "short"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi", "sort": "desc" }
+              }
+            },
+            {
+              "id": 5,
+              "type": "table",
+              "title": "Top reglas Falco (1h)",
+              "description": "Top 10 reglas por número de eventos en la última hora. Excluye 'Read sensitive file untrusted' desde namespaces sistema.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "topk(10, sum by (rule) (count_over_time({namespace=\"security\", app=\"falco\"} | json | rule != \"\" | rule != \"Read sensitive file untrusted\" or output_fields_k8s_ns_name !~ \"kube-system|monitoring|security|kube-flannel\" [1h])))",
+                  "instant": true,
+                  "legendFormat": ""
+                }
+              ],
+              "transformations": [
+                {
+                  "id": "organize",
+                  "options": {
+                    "excludeByName": { "Time": true },
+                    "renameByName": { "Value": "events" }
+                  }
+                },
+                {
+                  "id": "sortBy",
+                  "options": {
+                    "fields": {},
+                    "sort": [{ "field": "events", "desc": true }]
+                  }
+                }
+              ],
+              "fieldConfig": {
+                "defaults": { "custom": { "align": "left" } },
+                "overrides": []
+              },
+              "options": { "showHeader": true }
+            },
+            {
+              "id": 6,
+              "type": "logs",
+              "title": "Stream de eventos Falco",
+              "description": "Flujo crudo de eventos Falco, ordenados por timestamp descendente. Excluye 'Read sensitive file untrusted' desde namespaces sistema (ruido operacional legítimo del cluster). Click en cada línea para ver output_fields completo con proc.cmdline, container.image, etc.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 10, "w": 24, "x": 0, "y": 28 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "{namespace=\"security\", app=\"falco\"} | json | rule != \"\" | rule != \"Read sensitive file untrusted\" or output_fields_k8s_ns_name !~ \"kube-system|monitoring|security|kube-flannel\""
+                }
+              ],
+              "options": {
+                "showTime": true,
+                "showLabels": false,
+                "showCommonLabels": false,
+                "wrapLogMessage": true,
+                "prettifyLogMessage": false,
+                "enableLogDetails": true,
+                "dedupStrategy": "none",
+                "sortOrder": "Descending"
+              }
+            },
+            {
+              "id": 300,
+              "type": "row",
+              "title": "Tráfico HTTP por CMS (filtra por $cms)",
+              "collapsed": false,
+              "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
+              "panels": []
+            },
+            {
+              "id": 7,
+              "type": "timeseries",
+              "title": "Peticiones/s por CMS",
+              "description": "Tasa de peticiones HTTP que Suricata observa contra cada CMS (eth0 worker1). Se clasifica por dest_port: 30430 → DVWA, 30380 → WebGoat, 31592 → JuiceShop. Filtrado por $cms.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "sum by (cms) (rate({namespace=\"security\", app=\"suricata\"} | json event_type=\"event_type\", dport=\"dest_port\" | event_type=\"http\" | dport =~ \"$cms\" | label_format cms=`{{ if eq .dport \"30430\" }}DVWA{{ else if eq .dport \"30380\" }}WebGoat{{ else if eq .dport \"31592\" }}JuiceShop{{ else }}other{{ end }}` [1m]))",
+                  "legendFormat": "{{cms}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "fillOpacity": 70,
+                    "lineWidth": 1,
+                    "stacking": { "mode": "normal", "group": "A" }
+                  },
+                  "unit": "reqps"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi", "sort": "desc" }
+              }
+            },
+            {
+              "id": 8,
+              "type": "timeseries",
+              "title": "Status codes por CMS",
+              "description": "Distribución de status HTTP (2xx/3xx/4xx/5xx) por CMS. Pico de 4xx típico en path scanning (nikto, dirb); pico de 5xx revela payloads que rompen la app (SQLi, parsers). Filtrado por $cms.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "sum by (cms, status_class) (rate({namespace=\"security\", app=\"suricata\"} | json event_type=\"event_type\", dport=\"dest_port\", status=\"http.status\" | event_type=\"http\" | dport =~ \"$cms\" | label_format cms=`{{ if eq .dport \"30430\" }}DVWA{{ else if eq .dport \"30380\" }}WebGoat{{ else if eq .dport \"31592\" }}JuiceShop{{ else }}other{{ end }}`, status_class=`{{ if hasPrefix \"2\" .status }}2xx{{ else if hasPrefix \"3\" .status }}3xx{{ else if hasPrefix \"4\" .status }}4xx{{ else if hasPrefix \"5\" .status }}5xx{{ else }}?{{ end }}` [1m]))",
+                  "legendFormat": "{{cms}} {{status_class}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "fillOpacity": 70,
+                    "lineWidth": 1,
+                    "stacking": { "mode": "normal", "group": "A" }
+                  },
+                  "unit": "reqps"
+                },
+                "overrides": [
+                  { "matcher": { "id": "byRegexp", "options": ".+ 4xx$" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }] },
+                  { "matcher": { "id": "byRegexp", "options": ".+ 5xx$" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }
+                ]
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi", "sort": "desc" }
+              }
+            },
+            {
+              "id": 9,
+              "type": "table",
+              "title": "Top URIs por CMS (5m)",
+              "description": "Las URIs más golpeadas en los últimos 5 minutos, separadas por CMS. Útil para detectar enumeración (muchos hits en /admin, /backup, /.env, etc.) vs uso legítimo (rutas estables). Filtrado por $cms.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 10, "w": 12, "x": 0, "y": 47 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "topk(20, sum by (cms, url) (count_over_time({namespace=\"security\", app=\"suricata\"} | json event_type=\"event_type\", dport=\"dest_port\", url=\"http.url\" | event_type=\"http\" | dport =~ \"$cms\" | label_format cms=`{{ if eq .dport \"30430\" }}DVWA{{ else if eq .dport \"30380\" }}WebGoat{{ else if eq .dport \"31592\" }}JuiceShop{{ else }}other{{ end }}` [5m])))",
+                  "instant": true,
+                  "legendFormat": ""
+                }
+              ],
+              "transformations": [
+                {
+                  "id": "organize",
+                  "options": {
+                    "excludeByName": { "Time": true },
+                    "renameByName": { "Value": "hits", "cms": "CMS", "url": "URI" },
+                    "indexByName": { "cms": 0, "url": 1, "Value": 2 }
+                  }
+                },
+                {
+                  "id": "sortBy",
+                  "options": {
+                    "fields": {},
+                    "sort": [{ "field": "hits", "desc": true }]
+                  }
+                }
+              ],
+              "fieldConfig": { "defaults": { "custom": { "align": "left" } }, "overrides": [] },
+              "options": { "showHeader": true }
+            },
+            {
+              "id": 10,
+              "type": "table",
+              "title": "Top IPs origen por CMS (5m)",
+              "description": "Quién está atacando a quién. Cuando Kali (10.0.1.20) entre en el lab, su IP destacará aquí. 10.0.1.10 es el master (curls de prueba); 10.0.1.1 es el bridge libvirt (tráfico que NAT-ea desde fuera de la red red-prueba). Filtrado por $cms.",
+              "datasource": { "type": "loki", "uid": "loki" },
+              "gridPos": { "h": 10, "w": 12, "x": 12, "y": 47 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "topk(20, sum by (cms, srcip) (count_over_time({namespace=\"security\", app=\"suricata\"} | json event_type=\"event_type\", dport=\"dest_port\", srcip=\"src_ip\" | event_type=\"http\" | dport =~ \"$cms\" | label_format cms=`{{ if eq .dport \"30430\" }}DVWA{{ else if eq .dport \"30380\" }}WebGoat{{ else if eq .dport \"31592\" }}JuiceShop{{ else }}other{{ end }}` [5m])))",
+                  "instant": true,
+                  "legendFormat": ""
+                }
+              ],
+              "transformations": [
+                {
+                  "id": "organize",
+                  "options": {
+                    "excludeByName": { "Time": true },
+                    "renameByName": { "Value": "hits", "cms": "CMS", "srcip": "src IP" },
+                    "indexByName": { "srcip": 0, "cms": 1, "Value": 2 }
+                  }
+                },
+                {
+                  "id": "sortBy",
+                  "options": {
+                    "fields": {},
+                    "sort": [{ "field": "hits", "desc": true }]
+                  }
+                }
+              ],
+              "fieldConfig": { "defaults": { "custom": { "align": "left" } }, "overrides": [] },
+              "options": { "showHeader": true }
+            },
+            {
+              "id": 400,
+              "type": "row",
+              "title": "Cluster Health",
+              "collapsed": false,
+              "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+              "panels": []
+            },
+            {
+              "id": 11,
+              "type": "timeseries",
+              "title": "CPU por nodo (%)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "100 - (avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100)",
+                  "legendFormat": "{{node}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+                  "min": 0,
+                  "max": 100,
+                  "unit": "percent"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi" }
+              }
+            },
+            {
+              "id": 12,
+              "type": "timeseries",
+              "title": "Memoria por nodo (%)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "avg by (node) ((1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100)",
+                  "legendFormat": "{{node}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+                  "min": 0,
+                  "max": 100,
+                  "unit": "percent"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi" }
+              }
+            },
+            {
+              "id": 13,
+              "type": "timeseries",
+              "title": "Red por nodo (B/s) — rx ↑ / tx ↓",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 66 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "sum by (node) (rate(node_network_receive_bytes_total{device=\"eth0\"}[2m]))",
+                  "legendFormat": "{{node}} rx"
+                },
+                {
+                  "refId": "B",
+                  "expr": "-sum by (node) (rate(node_network_transmit_bytes_total{device=\"eth0\"}[2m]))",
+                  "legendFormat": "{{node}} tx"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 1 },
+                  "unit": "Bps"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi" }
+              }
+            },
+            {
+              "id": 14,
+              "type": "timeseries",
+              "title": "Disco I/O por nodo (B/s) — read ↑ / write ↓",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 66 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "sum by (node) (rate(node_disk_read_bytes_total{device=~\"vd.*\"}[2m]))",
+                  "legendFormat": "{{node}} read"
+                },
+                {
+                  "refId": "B",
+                  "expr": "-sum by (node) (rate(node_disk_written_bytes_total{device=~\"vd.*\"}[2m]))",
+                  "legendFormat": "{{node}} write"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "palette-classic" },
+                  "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 1 },
+                  "unit": "Bps"
+                },
+                "overrides": []
+              },
+              "options": {
+                "legend": { "displayMode": "list", "placement": "bottom" },
+                "tooltip": { "mode": "multi" }
+              }
+            },
+            {
+              "id": 15,
+              "type": "stat",
+              "title": "Filesystem / por nodo (%)",
+              "datasource": { "type": "prometheus", "uid": "prometheus" },
+              "gridPos": { "h": 5, "w": 24, "x": 0, "y": 74 },
+              "targets": [
+                {
+                  "refId": "A",
+                  "expr": "avg by (node) (100 - (node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay\"}) * 100)",
+                  "legendFormat": "{{node}}",
+                  "instant": false
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "color": { "mode": "thresholds" },
+                  "min": 0,
+                  "max": 100,
+                  "unit": "percent",
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      { "color": "green", "value": null },
+                      { "color": "yellow", "value": 70 },
+                      { "color": "red", "value": 85 }
+                    ]
+                  }
+                },
+                "overrides": []
+              },
+              "options": {
+                "orientation": "horizontal",
+                "colorMode": "background",
+                "graphMode": "area",
+                "textMode": "value_and_name",
+                "reduceOptions": {
+                  "values": false,
+                  "calcs": ["lastNotNull"]
+                }
+              }
+            }
+          ]
+        }

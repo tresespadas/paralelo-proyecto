@@ -1,0 +1,25 @@
+apiVersion: v2
+name: juiceshop
+description: |
+  OWASP Juice Shop standalone para el lab paralelo-proyecto.
+  Deployment 1-replica en worker1, namespace 'vulnerable'. Imagen oficial
+  `bkimminich/juice-shop` — Node.js + Express + SQLite efímera, todo en
+  un solo container. Service NodePort en 31592 (mismo del lab proyecto/).
+  Aplicación moderna con muchas categorías de vulnerabilidades OWASP Top 10.
+type: application
+
+# version del CHART. Juice Shop sí usa semver (15.x.x al escribir esto)
+# pero pinear 'latest' alinea con el patrón DVWA/WebGoat — para el lab
+# las breaking changes upstream son irrelevantes y queremos los retos
+# más recientes.
+version: 0.1.0
+appVersion: "latest"
+
+keywords:
+  - vulnerable
+  - lab
+  - juice-shop
+  - owasp
+  - security-testing
+maintainers:
+  - name: paralelo-proyecto
